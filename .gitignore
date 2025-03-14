@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual Environment
+venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+
+# Project specific
+pension_lottery/
+lottery/data/results/graph/
+lottery/src/bayesian/
+lottery/src/evaluation/
+lottery/src/meta_learning/
+lottery/src/optimizer/
+lottery/src/reinforcement/
+lottery/src/supervised/
+lottery/src/uncertainty/
+lottery/src/unsupervised/
+
+# Logs
+*.log
+
+
+node_modules/
+.git/
+dist/
+build/
+venv/
+env/
+*.min.js
+*.min.css
+coverage/
+.next/
+tmp/
+logs/
+.cache/
+.output/
+.DS_Store
+.history/
+.idea/
+*.map
+*.bundle.js
+yarn-error.log
+npm-debug.log*
+package-lock.json
+yarn.lock

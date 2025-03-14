@@ -1,0 +1,128 @@
+# DAEBAK_AI 통합 설정
+
+# 공통 설정
+common:
+  # CUDA 기본 설정
+  cuda:
+    use_gpu: true
+    memory_fraction: 0.95
+    allow_tf32: true
+    benchmark: true
+    deterministic: false
+    cudnn_enabled: true
+    compile_mode: true
+    device: cuda
+    gradient_accumulation_steps: 4
+    num_workers: 8
+    pin_memory: true
+    precision: float16
+  
+  # 기본 로깅 설정
+  logging:
+    level: "INFO"
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  # API 설정
+  api:
+    lotto_url: "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo="
+    pension_url: "https://www.dhlottery.co.kr/pension.do?method=pensionNumber&drwNo="
+
+# 로또 설정
+lotto:
+  data:
+    min_number: 1
+    max_number: 45
+    numbers_to_select: 6
+    sequence_length: 10
+    batch_size: 32
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    train_ratio: 0.7
+    val_ratio: 0.15
+    test_ratio: 0.15
+    historical_file: "lottery/data/raw/historical.csv"
+    api_url: "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo="
+    processed_data_path: "lottery/data/processed"
+    raw_data_path: "lottery/data/raw"
+
+  model_paths:
+    supervised:
+      lstm: "lottery/savedModels/supervised/lstm_model.pt"
+      xgboost: "lottery/savedModels/supervised/xgboost_model.pkl"
+      lightgbm: "lottery/savedModels/supervised/lightgbm_model.pkl"
+    unsupervised:
+      autoencoder: "lottery/savedModels/unsupervised/autoencoder.pt"
+      dimension_reducer: "lottery/savedModels/unsupervised/dimension_reducer.pt"
+    reinforcement:
+      dqn: "lottery/savedModels/reinforcement/dqn_model.pt"
+      ppo: "lottery/savedModels/reinforcement/ppo_model.pt"
+
+  model_weights:
+    supervised:
+      lstm: 0.3
+      xgboost: 0.2
+      lightgbm: 0.2
+    unsupervised:
+      autoencoder: 0.1
+      dimension_reducer: 0.1
+    reinforcement:
+      dqn: 0.05
+      ppo: 0.05
+
+  model:
+    dropout: 0.1
+    hidden_size: 256
+    learning_rate: 0.001
+    num_layers: 4
+    weight_decay: 1.0e-05
+
+  training:
+    epochs: 100
+    learning_rate: 0.001
+    early_stopping_patience: 10
+    dropout_rate: 0.3
+    weight_decay: 0.0001
+    gradient_clip: 1.0
+    batch_size: 128
+    validation_split: 0.2
+    num_epochs: 100
+
+  pattern_analysis:
+    markov_chain_order: 2
+    fourier_window_size: 52
+    trend_window_size: 10
+    significance_level: 0.05
+
+  backtesting:
+    initial_balance: 100000
+    max_tickets_per_draw: 5
+    confidence_threshold: 0.7
+    walk_forward_window: 52
+    cross_validation_folds: 5
+
+  logging:
+    file: "lottery/logs/lottery_prediction.log"
+
+  output:
+    predictions_file: "lottery/data/results/predictions.json"
+    analysis_dir: "lottery/data/results/analysis"
+    backtest_dir: "lottery/data/results/backtest"
+    model_checkpoints_dir: "lottery/savedModels/checkpoints"
+
+# 연금복권 설정
+pension:
+  data:
+    api_url: "https://www.dhlottery.co.kr/pension.do?method=pensionNumber&drwNo="
+    historical_file: "pension_lottery/data/raw/historical.csv"
+    processed_data_path: "pension_lottery/data/processed"
+    raw_data_path: "pension_lottery/data/raw"
+  
+  logging:
+    file: "pension_lottery/logs/pension_prediction.log"
+  
+  output:
+    predictions_file: "pension_lottery/data/results/predictions.json"
+    analysis_dir: "pension_lottery/data/results/analysis"
+    backtest_dir: "pension_lottery/data/results/backtest"
+    model_checkpoints_dir: "pension_lottery/savedModels/checkpoints" 

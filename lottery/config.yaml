@@ -1,0 +1,108 @@
+# 로또 예측 시스템 설정
+
+# CUDA 최적화 설정
+cuda:
+  use_gpu: true
+  memory_fraction: 0.95
+  allow_tf32: true
+  benchmark: true
+  deterministic: false
+  cudnn_enabled: true
+  compile_mode: true
+  device: cuda
+  gradient_accumulation_steps: 4
+  num_workers: 8
+  pin_memory: true
+  precision: float16
+
+# 데이터 관련 설정
+data:
+  min_number: 1
+  max_number: 45
+  numbers_to_select: 6
+  sequence_length: 10
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  historical_file: "data/raw/historical.csv"
+  api_url: "https://www.dhlottery.co.kr/common.do?method=getLottoNumber&drwNo="
+  processed_data_path: "data/processed"
+  raw_data_path: "data/raw"
+
+# 모델 경로 설정
+model_paths:
+  supervised:
+    lstm: "savedModels/supervised/lstm_model.pt"
+    xgboost: "savedModels/supervised/xgboost_model.pkl"
+    lightgbm: "savedModels/supervised/lightgbm_model.pkl"
+  unsupervised:
+    autoencoder: "savedModels/unsupervised/autoencoder.pt"
+    dimension_reducer: "savedModels/unsupervised/dimension_reducer.pt"
+  reinforcement:
+    dqn: "savedModels/reinforcement/dqn_model.pt"
+    ppo: "savedModels/reinforcement/ppo_model.pt"
+
+# 모델 가중치 설정
+model_weights:
+  supervised:
+    lstm: 0.3
+    xgboost: 0.2
+    lightgbm: 0.2
+  unsupervised:
+    autoencoder: 0.1
+    dimension_reducer: 0.1
+  reinforcement:
+    dqn: 0.05
+    ppo: 0.05
+
+# 모델 구조 설정
+model:
+  dropout: 0.1
+  hidden_size: 256
+  learning_rate: 0.001
+  num_layers: 4
+  weight_decay: 1.0e-05
+
+# 학습 파라미터
+training:
+  epochs: 100
+  learning_rate: 0.001
+  early_stopping_patience: 10
+  dropout_rate: 0.3
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  batch_size: 128
+  validation_split: 0.2
+  num_epochs: 100
+
+# 패턴 분석 설정
+pattern_analysis:
+  markov_chain_order: 2
+  fourier_window_size: 52
+  trend_window_size: 10
+  significance_level: 0.05
+
+# 백테스팅 설정
+backtesting:
+  initial_balance: 100000
+  max_tickets_per_draw: 5
+  confidence_threshold: 0.7
+  walk_forward_window: 52
+  cross_validation_folds: 5
+
+# 로깅 설정
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/lottery_prediction.log"
+
+# 결과 저장 설정
+output:
+  predictions_file: "data/results/predictions.json"
+  analysis_dir: "data/results/analysis"
+  backtest_dir: "data/results/backtest"
+  model_checkpoints_dir: "savedModels/checkpoints"
