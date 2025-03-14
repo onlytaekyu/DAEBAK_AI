@@ -294,25 +294,29 @@ class PatternAnalyzer:
         if cached_result:
             return cached_result
         
+        # 빈도 계산
         frequency = {}
         for numbers in self.data['numbers']:
             for num in numbers:
                 frequency[num] = frequency.get(num, 0) + 1
-                
+        
         # 확률 계산
         total_count = sum(frequency.values())
-        probabilities = {num: count/total_count for num, count in frequency.items()}
+        probabilities = {num: float(count)/total_count for num, count in frequency.items()}
         
         # 카이제곱 검정
         expected_freq = total_count / 45  # 균등 분포 가정
         chi2_stat = sum((count - expected_freq)**2 / expected_freq for count in frequency.values())
         p_value = 1 - stats.chi2.cdf(chi2_stat, df=44)  # 자유도 = 45-1
         
+        # 결과 구조화
         result = {
-            'frequency': frequency,
-            'probabilities': probabilities,
-            'chi2_stat': chi2_stat,
-            'p_value': p_value
+            'frequency': {int(k): int(v) for k, v in frequency.items()},
+            'probabilities': {int(k): float(v) for k, v in probabilities.items()},
+            'chi2_stat': float(chi2_stat),
+            'p_value': float(p_value),
+            'total_count': int(total_count),
+            'expected_frequency': float(expected_freq)
         }
         
         self._cache_result(cache_key, result)
@@ -352,30 +356,32 @@ class PatternAnalyzer:
     @safe_execute
     @log_performance
     def _analyze_oddeven_patterns(self) -> Dict[str, Any]:
-        """홀짝 패턴 분석"""
+        """홀/짝 패턴 분석"""
         cache_key = 'oddeven'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
-        pattern_counts = {}
-        total_count = 0
         
-        # 패턴 카운트 초기화
+        pattern_counts = {}
+        pattern_probabilities = {}
+        
+        # 각 회차별 홀/짝 패턴 분석
         for numbers in self.data['numbers']:
-            pattern = ''.join(['O' if n % 2 == 1 else 'E' for n in numbers])
-            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
-            total_count += 1
+            odd_count = sum(1 for n in numbers if n % 2 == 1)
+            even_count = 6 - odd_count
+            pattern = 'O' * odd_count + 'E' * even_count
             
-        # 패턴 확률 계산
-        pattern_probabilities = {
-            pattern: count / total_count 
-            for pattern, count in pattern_counts.items()
-        }
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+            
+        # 확률 계산
+        total_count = len(self.data['numbers'])
+        for pattern, count in pattern_counts.items():
+            pattern_probabilities[pattern] = float(count) / total_count
         
         result = {
-            'pattern_counts': pattern_counts,
-            'pattern_probabilities': pattern_probabilities
+            'pattern_counts': {k: int(v) for k, v in pattern_counts.items()},
+            'pattern_probabilities': {k: float(v) for k, v in pattern_probabilities.items()},
+            'total_count': int(total_count)
         }
         
         self._cache_result(cache_key, result)
@@ -434,18 +440,38 @@ class PatternAnalyzer:
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
+        
         gaps = []
+        gap_details = {}
+        
         for i in range(1, len(self.data)):
             prev_numbers = set(self.data.iloc[i-1]['numbers'])
             curr_numbers = set(self.data.iloc[i]['numbers'])
             gap = len(prev_numbers - curr_numbers)
             gaps.append(gap)
             
-        self.gap_stats['gap_mean'] = np.mean(gaps)
-        self.gap_stats['gap_std'] = np.std(gaps)
-        self._cache_result(cache_key, self.gap_stats)
-        return self.gap_stats
+            # 간격 상세 정보 기록
+            for num in range(1, 46):
+                if num in prev_numbers and num not in curr_numbers:
+                    if num not in gap_details:
+                        gap_details[num] = []
+                    gap_details[num].append(i)
+        
+        # 통계 계산
+        gap_mean = float(np.mean(gaps))
+        gap_std = float(np.std(gaps))
+        gap_median = float(np.median(gaps))
+        
+        result = {
+            'gap_mean': gap_mean,
+            'gap_std': gap_std,
+            'gap_median': gap_median,
+            'gaps': gaps,
+            'gap_details': gap_details
+        }
+        
+        self._cache_result(cache_key, result)
+        return result
 
     @safe_execute
     @log_performance
@@ -483,14 +509,19 @@ class PatternAnalyzer:
         for i in range(45):
             for j in range(45):
                 if transition_matrix[i, j] > threshold:
-                    high_probability_transitions.append((i+1, j+1, transition_matrix[i, j]))
+                    high_probability_transitions.append({
+                        'from': int(i + 1),
+                        'to': int(j + 1),
+                        'probability': float(transition_matrix[i, j])
+                    })
         
         result = {
             'transition_matrix': transition_matrix.tolist(),
             'high_probability_transitions': high_probability_transitions,
             'eigenvalues': eigenvalues.tolist(),
             'eigenvectors': eigenvectors.tolist(),
-            'stationary_distribution': stationary_dist.tolist()
+            'stationary_distribution': stationary_dist.tolist(),
+            'threshold': float(threshold)
         }
         
         self._cache_result(cache_key, result)
@@ -504,34 +535,34 @@ class PatternAnalyzer:
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
+        
         # 모든 번호를 1차원 배열로 변환
-        numbers = np.array([num for nums in self.data['numbers'] for num in nums])
+        all_numbers = np.array([num for numbers in self.data['numbers'] for num in numbers])
         
         # 푸리에 변환 수행
-        fft_result = np.fft.fft(numbers)
-        frequencies = np.fft.fftfreq(len(numbers))
+        fft_result = np.fft.fft(all_numbers)
+        frequencies = np.fft.fftfreq(len(all_numbers))
         
         # 진폭 계산
         amplitudes = np.abs(fft_result)
         
-        # 주요 주파수 성분 추출
-        significant_freq_mask = amplitudes > np.mean(amplitudes) + np.std(amplitudes)
-        significant_frequencies = frequencies[significant_freq_mask]
+        # 유의미한 주파수 성분 추출
+        threshold = np.mean(amplitudes) + np.std(amplitudes)
+        significant_freqs = frequencies[amplitudes > threshold]
         
         # 주기성 있는 번호 추출
-        periodic_numbers = []
-        for freq in significant_frequencies:
-            if freq > 0:  # 양의 주파수만 고려
-                period = int(1/freq)
-                if 1 <= period <= 45:  # 유효한 번호 범위
-                    periodic_numbers.append(period)
+        periodic_nums = []
+        for freq in significant_freqs:
+            if freq != 0:  # DC 성분 제외
+                period = int(round(1 / abs(freq)))
+                if 1 <= period <= 45:
+                    periodic_nums.append(period)
         
         result = {
-            'frequencies': frequencies.tolist(),
-            'amplitudes': amplitudes.tolist(),
-            'significant_frequencies': significant_frequencies.tolist(),
-            'periodic_numbers': periodic_numbers
+            'frequencies': [float(f) for f in frequencies],
+            'amplitudes': [float(m) for m in amplitudes],
+            'significant_frequencies': [float(f) for f in significant_freqs],
+            'periodic_numbers': sorted(list(set(periodic_nums)))
         }
         
         self._cache_result(cache_key, result)
@@ -545,44 +576,54 @@ class PatternAnalyzer:
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
+        
         duplicate_patterns = {}
         pattern_details = {}
+        total_rounds = len(self.data['numbers'])
+        duplicate_count = 0
         
+        # 각 회차별 중복 패턴 분석
         for i, numbers in enumerate(self.data['numbers']):
-            pattern = tuple(sorted(numbers))
-            if pattern in duplicate_patterns:
+            # 중복된 번호 찾기
+            duplicates = {}
+            for num in numbers:
+                if numbers.count(num) > 1:
+                    duplicates[num] = numbers.count(num)
+                    duplicate_count += 1
+                
+            if duplicates:
+                pattern = tuple(sorted(duplicates.keys()))
+                if pattern not in duplicate_patterns:
+                    duplicate_patterns[pattern] = 0
+                    pattern_details[pattern] = []
                 duplicate_patterns[pattern] += 1
-                pattern_details[pattern]['occurrence_count'] += 1
-                pattern_details[pattern]['gaps'].append(i - pattern_details[pattern]['last_occurrence'])
-                pattern_details[pattern]['last_occurrence'] = i
-            else:
-                duplicate_patterns[pattern] = 1
-                pattern_details[pattern] = {
-                    'occurrence_count': 1,
-                    'gaps': [],
-                    'last_occurrence': i
-                }
+                pattern_details[pattern].append({
+                    'round': i + 1,
+                    'numbers': list(numbers),
+                    'duplicates': duplicates
+                })
         
         # 통계 계산
-        total_patterns = len(duplicate_patterns)
-        duplicate_count = sum(1 for count in duplicate_patterns.values() if count > 1)
-        most_duplicated = max(duplicate_patterns.values()) if duplicate_patterns else 0
+        duplicate_rate = duplicate_count / total_rounds if total_rounds > 0 else 0
+        most_duplicated_count = max(duplicate_patterns.values()) if duplicate_patterns else 0
         
-        # 평균 중복 간격 계산
-        all_gaps = [gap for details in pattern_details.values() for gap in details['gaps']]
-        avg_gap = np.mean(all_gaps) if all_gaps else 0
+        # 중복 간격 계산
+        duplication_gaps = []
+        for pattern_info in pattern_details.values():
+            for i in range(1, len(pattern_info)):
+                gap = pattern_info[i]['round'] - pattern_info[i-1]['round']
+                duplication_gaps.append(gap)
         
-        statistics = {
-            'duplicate_rate': duplicate_count / total_patterns if total_patterns > 0 else 0,
-            'most_duplicated_count': most_duplicated,
-            'average_duplication_gap': avg_gap
-        }
+        average_duplication_gap = float(np.mean(duplication_gaps)) if duplication_gaps else 0
         
         result = {
             'duplicate_patterns': duplicate_patterns,
             'pattern_details': pattern_details,
-            'statistics': statistics
+            'statistics': {
+                'duplicate_rate': float(duplicate_rate),
+                'most_duplicated_count': int(most_duplicated_count),
+                'average_duplication_gap': float(average_duplication_gap)
+            }
         }
         
         self._cache_result(cache_key, result)
@@ -591,7 +632,7 @@ class PatternAnalyzer:
     @safe_execute
     @log_performance
     def _analyze_number_patterns(self) -> Dict[str, Any]:
-        """번호별 패턴 분석"""
+        """번호 패턴 분석"""
         cache_key = 'number'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
@@ -600,44 +641,36 @@ class PatternAnalyzer:
         pattern_counts = {'high': 0, 'low': 0}
         number_patterns = {}
         
-        # 1-45 번호에 대한 패턴 분석
+        # 1-45 번호별 패턴 분석
         for num in range(1, 46):
             appearances = []
             gaps = []
-            consecutive = 0
-            non_appearance = 0
-            last_appearance = -1
+            consecutive_count = 0
+            non_appearances = 0
             
             for i, numbers in enumerate(self.data['numbers']):
                 if num in numbers:
-                    if last_appearance == -1:
-                        consecutive = 1
-                    elif i - last_appearance == 1:
-                        consecutive += 1
-                    else:
-                        consecutive = 1
                     appearances.append(i)
-                    if last_appearance != -1:
-                        gaps.append(i - last_appearance)
-                    last_appearance = i
+                    consecutive_count += 1
+                    non_appearances = 0
+                    if num > 23:
+                        pattern_counts['high'] += 1
+                    else:
+                        pattern_counts['low'] += 1
                 else:
-                    non_appearance += 1
+                    consecutive_count = 0
+                    non_appearances += 1
                     
+                if i > 0 and num in numbers and num in self.data['numbers'][i-1]:
+                    gaps.append(i - appearances[-2])
+            
             number_patterns[num] = {
                 'appearances': appearances,
                 'gaps': gaps,
-                'consecutive': consecutive,
-                'non_appearance': non_appearance,
-                'last_appearance': last_appearance
+                'consecutive_count': consecutive_count,
+                'non_appearances': non_appearances
             }
-            
-        # 고/저 패턴 분석
-        for numbers in self.data['numbers']:
-            high_count = sum(1 for n in numbers if n > 23)
-            low_count = 6 - high_count
-            pattern_counts['high'] += high_count
-            pattern_counts['low'] += low_count
-            
+        
         result = {
             'pattern_counts': pattern_counts,
             'number_patterns': number_patterns
@@ -654,59 +687,76 @@ class PatternAnalyzer:
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
-        combination_counts = {}
+        
+        counts = {}
+        total = len(self.data['numbers'])
+        
+        # 조합 카운트
         for numbers in self.data['numbers']:
-            for i in range(len(numbers)-1):
-                for j in range(i+1, len(numbers)):
-                    combo = tuple(sorted([numbers[i], numbers[j]]))
-                    combination_counts[combo] = combination_counts.get(combo, 0) + 1
-                    
-        self.combination_stats['combination_counts'] = combination_counts
-        self._cache_result(cache_key, self.combination_stats)
-        return self.combination_stats
+            combo = tuple(sorted(numbers))
+            counts[combo] = counts.get(combo, 0) + 1
+        
+        # 확률 계산
+        probs = {combo: count/total for combo, count in counts.items()}
+        
+        # 가장 많이 나온 조합
+        most_common = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        result = {
+            'combination_counts': {str(k): int(v) for k, v in counts.items()},
+            'combination_probabilities': {str(k): float(v) for k, v in probs.items()},
+            'most_common_combinations': [list(combo) for combo, _ in most_common]
+        }
+        
+        self._cache_result(cache_key, result)
+        return result
 
     @safe_execute
     @log_performance
     def _analyze_moving_averages(self) -> Dict[str, Any]:
         """이동 평균 분석"""
-        cache_key = 'moving'
+        cache_key = 'moving_averages'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
         
-        # 합계 계산
+        # 각 번호별 합계 계산
         sums = [sum(numbers) for numbers in self.data['numbers']]
-        sums_series = pd.Series(sums)
         
         # 이동 평균 계산
-        ma5 = sums_series.rolling(window=5).mean()
-        ma10 = sums_series.rolling(window=10).mean()
-        ma20 = sums_series.rolling(window=20).mean()
+        ma5 = pd.Series(sums).rolling(window=5).mean().fillna(0).tolist()
+        ma10 = pd.Series(sums).rolling(window=10).mean().fillna(0).tolist()
+        ma20 = pd.Series(sums).rolling(window=20).mean().fillna(0).tolist()
         
-        # 골든/데드 크로스 포인트 계산
+        # 골든/데드 크로스 포인트 찾기
         cross_points = []
-        for i in range(20, len(ma5)):
-            if pd.isna(ma5[i]) or pd.isna(ma10[i]) or pd.isna(ma20[i]):
-                continue
+        for i in range(1, len(sums)):
             if ma5[i] > ma10[i] and ma5[i-1] <= ma10[i-1]:
-                cross_points.append(('golden', i))
+                cross_points.append({
+                    'type': 'golden',
+                    'round': i + 1,
+                    'value': float(ma5[i])
+                })
             elif ma5[i] < ma10[i] and ma5[i-1] >= ma10[i-1]:
-                cross_points.append(('dead', i))
+                cross_points.append({
+                    'type': 'dead',
+                    'round': i + 1,
+                    'value': float(ma5[i])
+                })
         
-        # 트렌드 강도 계산
+        # 추세 강도 계산
         trend_strength = []
-        for i in range(20, len(ma5)):
-            if pd.isna(ma5[i]) or pd.isna(ma10[i]):
-                trend_strength.append(0)
-                continue
-            strength = (ma5[i] - ma10[i]) / ma10[i] * 100
+        for i in range(len(sums)):
+            strength = 0
+            if i > 0 and ma5[i] > ma5[i-1]: strength += 1
+            if i > 0 and ma10[i] > ma10[i-1]: strength += 1
+            if i > 0 and ma20[i] > ma20[i-1]: strength += 1
             trend_strength.append(strength)
         
         result = {
-            'ma5': ma5.tolist(),
-            'ma10': ma10.tolist(),
-            'ma20': ma20.tolist(),
+            'ma5': [float(x) for x in ma5],
+            'ma10': [float(x) for x in ma10],
+            'ma20': [float(x) for x in ma20],
             'cross_points': cross_points,
             'trend_strength': trend_strength
         }
@@ -717,53 +767,48 @@ class PatternAnalyzer:
     @safe_execute
     @log_performance
     def _analyze_robust_stats(self) -> Dict[str, Any]:
-        """로버스트 통계 분석"""
+        """강건 통계 분석"""
         cache_key = 'robust'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
-        # 합계 계산
-        sums = [sum(numbers) for numbers in self.data['numbers']]
-        sums_array = np.array(sums)
         
-        # 로버스트 통계량 계산
-        median = np.median(sums_array)
-        q1 = np.percentile(sums_array, 25)
-        q3 = np.percentile(sums_array, 75)
-        iqr = q3 - q1
-        mad = np.median(np.abs(sums_array - median))
+        # 데이터 준비
+        sums = np.array([sum(numbers) for numbers in self.data['numbers']])
         
-        # 윈저화된 통계량 계산
-        lower_bound = np.percentile(sums_array, 5)
-        upper_bound = np.percentile(sums_array, 95)
-        winsorized_array = np.clip(sums_array, lower_bound, upper_bound)
+        # 기본 통계량 계산
+        median = float(np.median(sums))
+        q1 = float(np.percentile(sums, 25))
+        q3 = float(np.percentile(sums, 75))
+        iqr = float(q3 - q1)
+        mad = float(np.median(np.abs(sums - median)))
         
-        winsorized_mean = np.mean(winsorized_array)
-        winsorized_std = np.std(winsorized_array)
+        # Winsorization (5%와 95% 기준)
+        lower = np.percentile(sums, 5)
+        upper = np.percentile(sums, 95)
+        winsorized = np.clip(sums, lower, upper)
+        winsorized_mean = float(np.mean(winsorized))
+        winsorized_std = float(np.std(winsorized))
         
-        # 극단값 제거 후 통계량 계산
-        lower_fence = q1 - 1.5 * iqr
-        upper_fence = q3 + 1.5 * iqr
-        clean_array = sums_array[(sums_array >= lower_fence) & (sums_array <= upper_fence)]
-        
-        clean_mean = np.mean(clean_array)
-        clean_std = np.std(clean_array)
-        
-        # 극단값 개수 계산
-        outlier_count = np.sum((sums_array < lower_fence) | (sums_array > upper_fence))
+        # 이상치 제거 후 통계
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        clean_data = sums[(sums >= lower_bound) & (sums <= upper_bound)]
+        clean_mean = float(np.mean(clean_data))
+        clean_std = float(np.std(clean_data))
+        outlier_count = int(len(sums) - len(clean_data))
         
         result = {
-            'median': float(median),
-            'q1': float(q1),
-            'q3': float(q3),
-            'iqr': float(iqr),
-            'mad': float(mad),
-            'winsorized_mean': float(winsorized_mean),
-            'winsorized_std': float(winsorized_std),
-            'clean_mean': float(clean_mean),
-            'clean_std': float(clean_std),
-            'outlier_count': int(outlier_count)
+            'median': median,
+            'q1': q1,
+            'q3': q3,
+            'iqr': iqr,
+            'mad': mad,
+            'winsorized_mean': winsorized_mean,
+            'winsorized_std': winsorized_std,
+            'clean_mean': clean_mean,
+            'clean_std': clean_std,
+            'outlier_count': outlier_count
         }
         
         self._cache_result(cache_key, result)

@@ -70,6 +70,10 @@ class TestPatternAnalyzer(unittest.TestCase):
 
         # 패턴 분석기 초기화
         cls.analyzer = PatternAnalyzer(cls.config, cls.data_manager.data)
+        cls.analyzer._init_cache()
+
+        print(f"데이터 크기: {len(cls.analyzer.data)}")
+        print(f"첫 번째 행: {cls.analyzer.data.iloc[0]}")
 
     @classmethod
     def tearDownClass(cls):
@@ -445,6 +449,15 @@ class TestPatternAnalyzer(unittest.TestCase):
         self.assertTrue((graph_dir / 'combination_stats.png').exists())
         self.assertTrue((graph_dir / 'moving_averages.png').exists())
         self.assertTrue((graph_dir / 'robust_stats.png').exists())
+
+    def test_all_methods(self):
+        """모든 메서드 테스트"""
+        for method_name in ['_analyze_frequency', '_analyze_duplicate_patterns', '_analyze_fourier', 
+                           '_analyze_markov_chain', '_analyze_number_patterns', '_analyze_oddeven_patterns']:
+            method = getattr(self.analyzer, method_name)
+            result = method()
+            print(f"\n{method_name} 결과:")
+            print(result)
 
 if __name__ == '__main__':
     unittest.main()
