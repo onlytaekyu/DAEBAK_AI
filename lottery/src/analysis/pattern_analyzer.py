@@ -293,7 +293,7 @@ class PatternAnalyzer:
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
+        
         frequency = {}
         for numbers in self.data['numbers']:
             for num in numbers:
@@ -579,14 +579,14 @@ class PatternAnalyzer:
             'average_duplication_gap': avg_gap
         }
         
-        self.duplicate_stats = {
+        result = {
             'duplicate_patterns': duplicate_patterns,
             'pattern_details': pattern_details,
             'statistics': statistics
         }
         
-        self._cache_result(cache_key, self.duplicate_stats)
-        return self.duplicate_stats
+        self._cache_result(cache_key, result)
+        return result
 
     @safe_execute
     @log_performance
@@ -667,36 +667,137 @@ class PatternAnalyzer:
         return self.combination_stats
 
     @safe_execute
+    @log_performance
     def _analyze_moving_averages(self) -> Dict[str, Any]:
         """이동 평균 분석"""
         cache_key = 'moving'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-            
-        sums = [sum(numbers) for numbers in self.data['numbers']]
-        self.moving_stats['ma5'] = pd.Series(sums).rolling(5).mean().tolist()
-        self.moving_stats['ma10'] = pd.Series(sums).rolling(10).mean().tolist()
-        self.moving_stats['ma20'] = pd.Series(sums).rolling(20).mean().tolist()
         
-        self._cache_result(cache_key, self.moving_stats)
-        return self.moving_stats
+        # 합계 계산
+        sums = [sum(numbers) for numbers in self.data['numbers']]
+        sums_series = pd.Series(sums)
+        
+        # 이동 평균 계산
+        moving_averages = {}
+        for period in [5, 10, 20]:
+            ma = sums_series.rolling(window=period).mean()
+            cross_points = []
+            trend_strength = []
+            
+            # 골든/데드 크로스 포인트 계산
+            for i in range(period, len(ma)):
+                if pd.isna(ma[i]) or pd.isna(ma[i-1]):
+                    continue
+                if ma[i] > ma[i-1]:
+                    cross_points.append(1)  # 골든 크로스
+                else:
+                    cross_points.append(-1)  # 데드 크로스
+                
+            # 트렌드 강도 계산
+            for i in range(period, len(ma)):
+                if pd.isna(ma[i]):
+                    trend_strength.append(0)
+                    continue
+                strength = (ma[i] - ma[i-period]) / ma[i-period] * 100
+                trend_strength.append(strength)
+            
+            moving_averages[f'ma_{period}'] = {
+                'moving_averages': ma.tolist(),
+                'cross_points': cross_points,
+                'trend_strength': trend_strength
+            }
+        
+        # 트렌드 방향성 계산
+        trend_direction = {}
+        for period in [5, 10, 20]:
+            ma = sums_series.rolling(window=period).mean()
+            direction = []
+            for i in range(len(ma)):
+                if pd.isna(ma[i]):
+                    direction.append(0)
+                    continue
+                if i == 0:
+                    direction.append(0)
+                    continue
+                if ma[i] > ma[i-1]:
+                    direction.append(1)  # 상승
+                elif ma[i] < ma[i-1]:
+                    direction.append(-1)  # 하락
+                else:
+                    direction.append(0)  # 보합
+            trend_direction[f'ma_{period}'] = direction
+        
+        result = {
+            'moving_averages': moving_averages,
+            'trend_direction': trend_direction
+        }
+        
+        self._cache_result(cache_key, result)
+        return result
 
     @safe_execute
+    @log_performance
     def _analyze_robust_stats(self) -> Dict[str, Any]:
-        """강건 통계 분석"""
+        """로버스트 통계 분석"""
         cache_key = 'robust'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
             
+        # 합계 계산
         sums = [sum(numbers) for numbers in self.data['numbers']]
-        self.robust_stats['median'] = np.median(sums)
-        self.robust_stats['mad'] = np.median(np.abs(sums - self.robust_stats['median']))
-        self.robust_stats['iqr'] = np.percentile(sums, 75) - np.percentile(sums, 25)
+        sums_array = np.array(sums)
         
-        self._cache_result(cache_key, self.robust_stats)
-        return self.robust_stats
+        # 로버스트 통계량 계산
+        robust_stats = {
+            'median': np.median(sums_array),
+            'q1': np.percentile(sums_array, 25),
+            'q3': np.percentile(sums_array, 75),
+            'iqr': np.percentile(sums_array, 75) - np.percentile(sums_array, 25),
+            'mad': np.median(np.abs(sums_array - np.median(sums_array)))
+        }
+        
+        # 윈저화된 통계량 계산
+        lower_bound = np.percentile(sums_array, 5)
+        upper_bound = np.percentile(sums_array, 95)
+        winsorized_array = np.clip(sums_array, lower_bound, upper_bound)
+        
+        winsorized_stats = {
+            'mean': np.mean(winsorized_array),
+            'std': np.std(winsorized_array),
+            'median': np.median(winsorized_array),
+            'q1': np.percentile(winsorized_array, 25),
+            'q3': np.percentile(winsorized_array, 75)
+        }
+        
+        # 극단값 제거 후 통계량 계산
+        iqr = robust_stats['iqr']
+        lower_fence = robust_stats['q1'] - 1.5 * iqr
+        upper_fence = robust_stats['q3'] + 1.5 * iqr
+        clean_array = sums_array[(sums_array >= lower_fence) & (sums_array <= upper_fence)]
+        
+        clean_stats = {
+            'mean': np.mean(clean_array),
+            'std': np.std(clean_array),
+            'median': np.median(clean_array),
+            'q1': np.percentile(clean_array, 25),
+            'q3': np.percentile(clean_array, 75)
+        }
+        
+        # 극단값 개수 계산
+        outlier_count = np.sum((sums_array < lower_fence) | (sums_array > upper_fence))
+        
+        result = {
+            'robust_stats': robust_stats,
+            'winsorized_stats': winsorized_stats,
+            'clean_stats': clean_stats,
+            'outlier_count': int(outlier_count)
+        }
+        
+        self._cache_result(cache_key, result)
+        return result
 
     def _plot_all_patterns(self, plot_dir: Union[str, Path]):
         """
