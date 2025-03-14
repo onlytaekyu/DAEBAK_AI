@@ -5,7 +5,7 @@
 """
 
 from pathlib import Path
-from .utils.config import Config
+from .src.utils.config import Config
 from .src.analysis.pattern_analyzer import PatternAnalyzer, PatternAnalysisConfig
 from .src.utils.data_loader import DataManager
 

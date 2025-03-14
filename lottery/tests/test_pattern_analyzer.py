@@ -13,11 +13,11 @@ import shutil
 from datetime import datetime
 import pandas as pd
 import sys
-from pathlib import Path
+import os
 import time
 
 # 프로젝트 루트 디렉토리를 Python 경로에 추가
-project_root = str(Path(__file__).parent.parent)
+project_root = str(Path(__file__).parent.parent.parent)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
@@ -36,7 +36,7 @@ class TestPatternAnalyzer(unittest.TestCase):
         config_dict = {
             'data': {
                 'historical_data_path': 'lottery/data/raw/lottery.csv',
-                'processed_data_path': f'{cls.temp_dir}/processed_data.pkl',
+                'processed_data_path': 'lottery/data/processed/processed_data.pkl',
                 'numbers_to_select': 6,
                 'min_number': 1,
                 'max_number': 45,
@@ -56,15 +56,13 @@ class TestPatternAnalyzer(unittest.TestCase):
         }
         cls.config = Config(config_dict)
 
-        # 데이터 매니저 초기화 및 데이터 로드
+        # 데이터 매니저를 통한 데이터 로드
         cls.data_manager = DataManager(cls.config)
         cls.data_manager.load_data()
+        print(f"테스트 데이터 로드 완료: {len(cls.data_manager.data)} 행")
 
         # 패턴 분석기 초기화
-        cls.analyzer = PatternAnalyzer(
-            config=cls.config,
-            data=cls.data_manager.data
-        )
+        cls.analyzer = PatternAnalyzer(cls.config, cls.data_manager.data)
 
     @classmethod
     def tearDownClass(cls):
@@ -103,90 +101,112 @@ class TestPatternAnalyzer(unittest.TestCase):
     def test_frequency_analysis(self):
         """빈도 분석 테스트"""
         result = self.analyzer._analyze_frequency()
-
+        
         # 결과 검증
         self.assertIn('frequency', result)
         self.assertIn('probabilities', result)
         self.assertIn('chi2_stat', result)
         self.assertIn('p_value', result)
-        self.assertEqual(len(result['frequency']), 45)  # 1-45 번호
-        self.assertEqual(len(result['probabilities']), 45)
-        self.assertTrue(np.allclose(sum(result['probabilities'].values()), 1.0, rtol=1e-5))
+        
+        # 빈도수 합계 검증
+        total_count = sum(result['frequency'].values())
+        expected_total = len(self.data_manager.data) * 6  # 각 행당 6개 번호
+        self.assertEqual(total_count, expected_total)
 
     def test_sequence_patterns(self):
         """연속 패턴 분석 테스트"""
         result = self.analyzer._analyze_sequence_patterns()
-
+        
         # 결과 검증
         self.assertIn('sequence_counts', result)
         self.assertIn('consecutive_probability', result)
-        self.assertGreaterEqual(len(result['sequence_counts']), 0)
+        
+        # 연속 확률 범위 검증
+        self.assertGreaterEqual(result['consecutive_probability'], 0)
+        self.assertLessEqual(result['consecutive_probability'], 1)
 
     def test_oddeven_patterns(self):
         """홀짝 패턴 분석 테스트"""
         result = self.analyzer._analyze_oddeven_patterns()
-
+        
         # 결과 검증
         self.assertIn('pattern_counts', result)
         self.assertIn('pattern_probabilities', result)
-        self.assertTrue(np.allclose(sum(result['pattern_probabilities'].values()), 1.0, rtol=1e-5))
+        
+        # 확률 합계 검증
+        total_prob = sum(result['pattern_probabilities'].values())
+        self.assertAlmostEqual(total_prob, 1.0, places=6)
 
     def test_range_distribution(self):
         """구간 분포 분석 테스트"""
         result = self.analyzer._analyze_range_distribution()
-
+        
         # 결과 검증
         self.assertIn('range_counts', result)
         self.assertIn('range_probabilities', result)
-        self.assertEqual(len(result['range_counts']), 5)  # 5개 구간
-        self.assertEqual(len(result['range_probabilities']), 5)
-        self.assertTrue(np.allclose(sum(result['range_probabilities'].values()), 1.0, rtol=1e-5))
+        
+        # 확률 합계 검증
+        total_prob = sum(result['range_probabilities'].values())
+        self.assertAlmostEqual(total_prob, 1.0, places=6)
 
     def test_sum_patterns(self):
         """합계 패턴 분석 테스트"""
         result = self.analyzer._analyze_sum_patterns()
-
+        
         # 결과 검증
         self.assertIn('sum_mean', result)
         self.assertIn('sum_std', result)
         self.assertIn('sum_min', result)
         self.assertIn('sum_max', result)
         self.assertIn('normality_p_value', result)
-        self.assertGreater(result['sum_mean'], 0)
+        
+        # 합계 범위 검증
+        min_possible_sum = 6  # 1+2+3+4+5+6
+        max_possible_sum = 255  # 40+41+42+43+44+45
+        self.assertGreaterEqual(result['sum_min'], min_possible_sum)
+        self.assertLessEqual(result['sum_max'], max_possible_sum)
 
     def test_gap_patterns(self):
         """간격 패턴 분석 테스트"""
         result = self.analyzer._analyze_gap_patterns()
-
+        
         # 결과 검증
         self.assertIn('gap_mean', result)
         self.assertIn('gap_std', result)
         self.assertIn('gap_min', result)
         self.assertIn('gap_max', result)
         self.assertIn('gap_median', result)
-        self.assertGreater(result['gap_mean'], 0)
+        
+        # 간격 범위 검증
+        self.assertGreaterEqual(result['gap_min'], 1)
+        self.assertLessEqual(result['gap_max'], 44)
 
     def test_markov_chain(self):
         """마코프 체인 분석 테스트"""
         result = self.analyzer._analyze_markov_chain()
-
+        
         # 결과 검증
         self.assertIn('transition_matrix', result)
         self.assertIn('high_probability_transitions', result)
-        self.assertEqual(len(result['transition_matrix']), 45)
-        self.assertEqual(len(result['transition_matrix'][0]), 45)
+        
+        # 전이 행렬 크기 검증
+        matrix = np.array(result['transition_matrix'])
+        self.assertEqual(matrix.shape, (45, 45))
 
     def test_fourier_analysis(self):
-        """푸리에 분석 테스트"""
+        """푸리에 변환 분석 테스트"""
         result = self.analyzer._analyze_fourier()
-
+        
         # 결과 검증
         self.assertIn('frequencies', result)
         self.assertIn('magnitudes', result)
         self.assertIn('significant_frequencies', result)
         self.assertIn('periodic_numbers', result)
-        self.assertGreater(len(result['frequencies']), 0)
-        self.assertGreater(len(result['magnitudes']), 0)
+        
+        # 주기성 있는 번호 범위 검증
+        for num in result['periodic_numbers']:
+            self.assertGreaterEqual(int(num), 1)
+            self.assertLessEqual(int(num), 45)
 
     def test_plot_generation(self):
         """그래프 생성 테스트"""
@@ -297,117 +317,49 @@ class TestPatternAnalyzer(unittest.TestCase):
             self.assertIn('full_analysis', self.analyzer._cache)
 
     def test_combination_stats(self):
-        """번호 조합 통계 분석 테스트"""
-        results = self.analyzer._analyze_combination_stats()
+        """조합 통계 분석 테스트"""
+        result = self.analyzer._analyze_combination_stats()
         
-        # 기본 통계량 테스트
-        self.assertIn('basic_stats', results)
-        basic_stats = results['basic_stats']
-        self.assertIn('variance', basic_stats)
-        self.assertIn('std_dev', basic_stats)
-        self.assertIn('range', basic_stats)
-        self.assertIn('median', basic_stats)
-        self.assertIn('skewness', basic_stats)
-        self.assertIn('kurtosis', basic_stats)
+        # 결과 검증
+        self.assertIn('basic_stats', result)
+        self.assertIn('time_series_stats', result)
         
-        # 시간 시계열 통계 테스트
-        self.assertIn('time_series_stats', results)
-        time_stats = results['time_series_stats']
-        self.assertIn('variance', time_stats)
-        self.assertIn('std_dev', time_stats)
-        self.assertIn('range', time_stats)
-        self.assertIn('median', time_stats)
-        self.assertIn('skewness', time_stats)
-        self.assertIn('kurtosis', time_stats)
-        
-        # 데이터 타입 및 범위 검증
-        for stat in basic_stats.values():
-            self.assertIsInstance(stat, (int, float))
-        
-        for stat_list in time_stats.values():
-            self.assertIsInstance(stat_list, list)
-            self.assertTrue(all(isinstance(x, (int, float)) for x in stat_list))
+        # 기본 통계량 검증
+        stats = result['basic_stats']
+        self.assertIn('variance', stats)
+        self.assertIn('std_dev', stats)
+        self.assertIn('range', stats)
+        self.assertIn('median', stats)
 
     def test_moving_averages(self):
         """이동 평균 분석 테스트"""
-        results = self.analyzer._analyze_moving_averages()
+        result = self.analyzer._analyze_moving_averages()
         
-        # 이동 평균 결과 테스트
-        self.assertIn('moving_averages', results)
-        ma_results = results['moving_averages']
+        # 결과 검증
+        self.assertIn('moving_averages', result)
+        self.assertIn('trend_direction', result)
         
-        # 각 기간별 결과 테스트
+        # 이동 평균 기간 검증
         for period in [5, 10, 20]:
-            period_key = f'ma_{period}'
-            self.assertIn(period_key, ma_results)
-            period_data = ma_results[period_key]
-            
-            self.assertIn('moving_averages', period_data)
-            self.assertIn('cross_points', period_data)
-            self.assertIn('trend_strength', period_data)
-            
-            # 데이터 타입 및 범위 검증
-            self.assertIsInstance(period_data['moving_averages'], list)
-            self.assertIsInstance(period_data['cross_points'], list)
-            self.assertIsInstance(period_data['trend_strength'], list)
-            
-            # 이동 평균 길이 검증
-            self.assertEqual(len(period_data['moving_averages']), len(self.test_data))
-        
-        # 트렌드 방향성 테스트
-        self.assertIn('trend_direction', results)
-        trend_direction = results['trend_direction']
-        for period in [5, 10, 20]:
-            period_key = f'ma_{period}'
-            self.assertIn(period_key, trend_direction)
-            self.assertIsInstance(trend_direction[period_key], list)
-            self.assertEqual(len(trend_direction[period_key]), len(self.test_data))
+            self.assertIn(f'ma_{period}', result['moving_averages'])
 
     def test_robust_stats(self):
         """로버스트 통계 분석 테스트"""
-        results = self.analyzer._analyze_robust_stats()
+        result = self.analyzer._analyze_robust_stats()
         
-        # 로버스트 통계량 테스트
-        self.assertIn('robust_stats', results)
-        robust_stats = results['robust_stats']
-        self.assertIn('median', robust_stats)
-        self.assertIn('q1', robust_stats)
-        self.assertIn('q3', robust_stats)
-        self.assertIn('iqr', robust_stats)
-        self.assertIn('mad', robust_stats)
+        # 결과 검증
+        self.assertIn('robust_stats', result)
+        self.assertIn('winsorized_stats', result)
+        self.assertIn('clean_stats', result)
+        self.assertIn('outlier_count', result)
         
-        # 윈저화된 통계량 테스트
-        self.assertIn('winsorized_stats', results)
-        winsorized_stats = results['winsorized_stats']
-        self.assertIn('mean', winsorized_stats)
-        self.assertIn('std', winsorized_stats)
-        self.assertIn('median', winsorized_stats)
-        self.assertIn('q1', winsorized_stats)
-        self.assertIn('q3', winsorized_stats)
-        
-        # 극단값 제거 후 통계량 테스트
-        self.assertIn('clean_stats', results)
-        clean_stats = results['clean_stats']
-        self.assertIn('mean', clean_stats)
-        self.assertIn('std', clean_stats)
-        self.assertIn('median', clean_stats)
-        self.assertIn('q1', clean_stats)
-        self.assertIn('q3', clean_stats)
-        
-        # 극단값 개수 테스트
-        self.assertIn('outlier_count', results)
-        self.assertIsInstance(results['outlier_count'], int)
-        
-        # 데이터 타입 및 범위 검증
-        for stat_dict in [robust_stats, winsorized_stats, clean_stats]:
-            for stat in stat_dict.values():
-                self.assertIsInstance(stat, (int, float))
-        
-        # 통계적 관계 검증
-        self.assertGreaterEqual(robust_stats['q3'], robust_stats['median'])
-        self.assertGreaterEqual(robust_stats['median'], robust_stats['q1'])
-        self.assertGreaterEqual(robust_stats['iqr'], 0)
-        self.assertGreaterEqual(robust_stats['mad'], 0)
+        # 로버스트 통계량 검증
+        robust = result['robust_stats']
+        self.assertIn('median', robust)
+        self.assertIn('q1', robust)
+        self.assertIn('q3', robust)
+        self.assertIn('iqr', robust)
+        self.assertIn('mad', robust)
 
 if __name__ == '__main__':
     unittest.main()

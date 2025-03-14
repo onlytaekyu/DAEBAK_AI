@@ -18,16 +18,7 @@ env/
 .idea/
 
 # Project specific
-pension_lottery/
 lottery/data/results/graph/
-lottery/src/bayesian/
-lottery/src/evaluation/
-lottery/src/meta_learning/
-lottery/src/optimizer/
-lottery/src/reinforcement/
-lottery/src/supervised/
-lottery/src/uncertainty/
-lottery/src/unsupervised/
 
 # Logs
 *.log

@@ -628,8 +628,8 @@ class PatternAnalyzer:
             'total_numbers': len(number_patterns),
             'average_appearances': np.mean([info['total_appearances'] for info in number_patterns.values()]),
             'std_appearances': np.std([info['total_appearances'] for info in number_patterns.values()]),
-            'average_non_appearance': np.mean([info['average_non_appearance'] for info in number_patterns.values()]),
-            'max_non_appearance': max(info['max_non_appearance'] for info in number_patterns.values())
+            'average_non_appearance': np.mean([info['statistics']['average_non_appearance'] for info in number_patterns.values()]),
+            'max_non_appearance': max(info['statistics']['max_non_appearance'] for info in number_patterns.values())
         }
 
         result = {
@@ -738,9 +738,9 @@ class PatternAnalyzer:
             # 골든/데드 크로스 분석
             cross_points = []
             for i in range(period, len(numbers_tensor)):
-                prev_diff = ma[i-1] - ma[i-2]
-                curr_diff = ma[i] - ma[i-1]
-                cross_points.append(torch.sum((prev_diff * curr_diff) < 0).item())
+                prev_diff = ma[i-1].cpu().numpy() - ma[i-2].cpu().numpy()
+                curr_diff = ma[i].cpu().numpy() - ma[i-1].cpu().numpy()
+                cross_points.append(np.sum((prev_diff * curr_diff) < 0))
 
             # 트렌드 강도 계산
             trend_strength = torch.abs(ma[period:] - ma[period-1:-1]).mean(dim=0)
@@ -754,7 +754,7 @@ class PatternAnalyzer:
         # 트렌드 방향성 분석
         trend_direction = {}
         for period in periods:
-            ma_data = moving_avg_results[f'ma_{period}']['moving_averages']
+            ma_data = np.array(moving_avg_results[f'ma_{period}']['moving_averages'])
             direction = np.zeros(len(ma_data))
             for i in range(1, len(ma_data)):
                 direction[i] = np.mean(ma_data[i] - ma_data[i-1])
@@ -788,12 +788,13 @@ class PatternAnalyzer:
         numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
 
         # 기본 로버스트 통계량 계산
+        median = torch.median(numbers_tensor)
         robust_stats = {
-            'median': torch.median(numbers_tensor).item(),
+            'median': median.item(),
             'q1': torch.quantile(numbers_tensor, 0.25).item(),
             'q3': torch.quantile(numbers_tensor, 0.75).item(),
             'iqr': torch.quantile(numbers_tensor, 0.75).item() - torch.quantile(numbers_tensor, 0.25).item(),
-            'mad': torch.median(torch.abs(numbers_tensor - torch.median(numbers_tensor))).item()
+            'mad': torch.median(torch.abs(numbers_tensor - median)).item()
         }
 
         # 윈저화 적용 (상위/하위 5% 제한)
@@ -1221,18 +1222,40 @@ class PatternAnalyzer:
 
 # 모듈 테스트
 if __name__ == "__main__":
-    # 예시 데이터 생성
-    np.random.seed(42)
-    n_samples = 1000
-    numbers = np.random.randint(1, 46, size=(n_samples, 6))
-
     print("=== 패턴 분석 테스트 ===")
 
     # 설정 객체 생성
-    config = Config()
+    config_dict = {
+        'data': {
+            'historical_data_path': 'lottery/data/raw/lottery.csv',
+            'processed_data_path': 'lottery/data/processed/processed_data.pkl',
+            'numbers_to_select': 6,
+            'min_number': 1,
+            'max_number': 45,
+            'batch_size': 32,
+            'num_workers': 4
+        },
+        'pattern_analysis': {
+            'markov_chain_order': 2,
+            'fourier_window_size': 52,
+            'trend_window_size': 10,
+            'significance_level': 0.05,
+            'use_gpu': torch.cuda.is_available(),
+            'num_workers': 4,
+            'batch_size': 32,
+            'cache_size': 1000
+        }
+    }
+    config = Config(config_dict)
+
+    # 데이터 매니저를 통한 데이터 로드
+    from lottery.src.utils.data_loader import DataManager
+    data_manager = DataManager(config)
+    data_manager.load_data()
+    print(f"데이터 로드 완료: {len(data_manager.data)} 행")
 
     # 패턴 분석
-    analyzer = PatternAnalyzer(config)
+    analyzer = PatternAnalyzer(config, data_manager.data)
     results = analyzer.analyze()
 
     print("\n빈도 분석 결과:")
