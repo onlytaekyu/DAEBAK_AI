@@ -680,58 +680,35 @@ class PatternAnalyzer:
         sums_series = pd.Series(sums)
         
         # 이동 평균 계산
-        moving_averages = {}
-        for period in [5, 10, 20]:
-            ma = sums_series.rolling(window=period).mean()
-            cross_points = []
-            trend_strength = []
-            
-            # 골든/데드 크로스 포인트 계산
-            for i in range(period, len(ma)):
-                if pd.isna(ma[i]) or pd.isna(ma[i-1]):
-                    continue
-                if ma[i] > ma[i-1]:
-                    cross_points.append(1)  # 골든 크로스
-                else:
-                    cross_points.append(-1)  # 데드 크로스
-                
-            # 트렌드 강도 계산
-            for i in range(period, len(ma)):
-                if pd.isna(ma[i]):
-                    trend_strength.append(0)
-                    continue
-                strength = (ma[i] - ma[i-period]) / ma[i-period] * 100
-                trend_strength.append(strength)
-            
-            moving_averages[f'ma_{period}'] = {
-                'moving_averages': ma.tolist(),
-                'cross_points': cross_points,
-                'trend_strength': trend_strength
-            }
+        ma5 = sums_series.rolling(window=5).mean()
+        ma10 = sums_series.rolling(window=10).mean()
+        ma20 = sums_series.rolling(window=20).mean()
         
-        # 트렌드 방향성 계산
-        trend_direction = {}
-        for period in [5, 10, 20]:
-            ma = sums_series.rolling(window=period).mean()
-            direction = []
-            for i in range(len(ma)):
-                if pd.isna(ma[i]):
-                    direction.append(0)
-                    continue
-                if i == 0:
-                    direction.append(0)
-                    continue
-                if ma[i] > ma[i-1]:
-                    direction.append(1)  # 상승
-                elif ma[i] < ma[i-1]:
-                    direction.append(-1)  # 하락
-                else:
-                    direction.append(0)  # 보합
-            trend_direction[f'ma_{period}'] = direction
+        # 골든/데드 크로스 포인트 계산
+        cross_points = []
+        for i in range(20, len(ma5)):
+            if pd.isna(ma5[i]) or pd.isna(ma10[i]) or pd.isna(ma20[i]):
+                continue
+            if ma5[i] > ma10[i] and ma5[i-1] <= ma10[i-1]:
+                cross_points.append(('golden', i))
+            elif ma5[i] < ma10[i] and ma5[i-1] >= ma10[i-1]:
+                cross_points.append(('dead', i))
+        
+        # 트렌드 강도 계산
+        trend_strength = []
+        for i in range(20, len(ma5)):
+            if pd.isna(ma5[i]) or pd.isna(ma10[i]):
+                trend_strength.append(0)
+                continue
+            strength = (ma5[i] - ma10[i]) / ma10[i] * 100
+            trend_strength.append(strength)
         
         result = {
-            'moving_averages': moving_averages,
-            'trend_direction': trend_direction
+            'ma5': ma5.tolist(),
+            'ma10': ma10.tolist(),
+            'ma20': ma20.tolist(),
+            'cross_points': cross_points,
+            'trend_strength': trend_strength
         }
         
         self._cache_result(cache_key, result)
@@ -751,48 +728,41 @@ class PatternAnalyzer:
         sums_array = np.array(sums)
         
         # 로버스트 통계량 계산
-        robust_stats = {
-            'median': np.median(sums_array),
-            'q1': np.percentile(sums_array, 25),
-            'q3': np.percentile(sums_array, 75),
-            'iqr': np.percentile(sums_array, 75) - np.percentile(sums_array, 25),
-            'mad': np.median(np.abs(sums_array - np.median(sums_array)))
-        }
+        median = np.median(sums_array)
+        q1 = np.percentile(sums_array, 25)
+        q3 = np.percentile(sums_array, 75)
+        iqr = q3 - q1
+        mad = np.median(np.abs(sums_array - median))
         
         # 윈저화된 통계량 계산
         lower_bound = np.percentile(sums_array, 5)
         upper_bound = np.percentile(sums_array, 95)
         winsorized_array = np.clip(sums_array, lower_bound, upper_bound)
         
-        winsorized_stats = {
-            'mean': np.mean(winsorized_array),
-            'std': np.std(winsorized_array),
-            'median': np.median(winsorized_array),
-            'q1': np.percentile(winsorized_array, 25),
-            'q3': np.percentile(winsorized_array, 75)
-        }
+        winsorized_mean = np.mean(winsorized_array)
+        winsorized_std = np.std(winsorized_array)
         
         # 극단값 제거 후 통계량 계산
-        iqr = robust_stats['iqr']
-        lower_fence = robust_stats['q1'] - 1.5 * iqr
-        upper_fence = robust_stats['q3'] + 1.5 * iqr
+        lower_fence = q1 - 1.5 * iqr
+        upper_fence = q3 + 1.5 * iqr
         clean_array = sums_array[(sums_array >= lower_fence) & (sums_array <= upper_fence)]
         
-        clean_stats = {
-            'mean': np.mean(clean_array),
-            'std': np.std(clean_array),
-            'median': np.median(clean_array),
-            'q1': np.percentile(clean_array, 25),
-            'q3': np.percentile(clean_array, 75)
-        }
+        clean_mean = np.mean(clean_array)
+        clean_std = np.std(clean_array)
         
         # 극단값 개수 계산
         outlier_count = np.sum((sums_array < lower_fence) | (sums_array > upper_fence))
         
         result = {
-            'robust_stats': robust_stats,
-            'winsorized_stats': winsorized_stats,
-            'clean_stats': clean_stats,
+            'median': float(median),
+            'q1': float(q1),
+            'q3': float(q3),
+            'iqr': float(iqr),
+            'mad': float(mad),
+            'winsorized_mean': float(winsorized_mean),
+            'winsorized_std': float(winsorized_std),
+            'clean_mean': float(clean_mean),
+            'clean_std': float(clean_std),
             'outlier_count': int(outlier_count)
         }
         
