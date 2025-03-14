@@ -169,30 +169,25 @@ class PatternAnalyzer:
         self._cache_timestamps = {}
         self._cache_hashes = {}
 
-    @safe_execute
+    def _cache_result(self, key: str, result: Dict[str, Any]):
+        """결과 캐싱"""
+        with self.cache_lock:
+            self._cache[key] = result
+            self._cache_timestamps[key] = time.time()
+            self._cache_hashes[key] = self._calculate_data_hash()
+
     def _get_cached_result(self, key: str) -> Optional[Dict[str, Any]]:
-        """
-        캐시된 결과 조회
-
-        Args:
-            key: 캐시 키
-
-        Returns:
-            캐시된 결과 또는 None
-        """
+        """캐시된 결과 조회"""
         with self.cache_lock:
             if key in self._cache:
-                # 테스트 모드에서는 캐시 유효성 검사 생략
                 if self.config.get('testing_mode', False):
                     return self._cache[key]
                 
-                # 일반 모드에서는 캐시 유효 시간 및 데이터 해시 확인
                 if time.time() - self._cache_timestamps[key] < self.pattern_config.cache_ttl:
                     current_hash = self._calculate_data_hash()
                     if current_hash == self._cache_hashes.get(key):
                         return self._cache[key]
                 
-                # 캐시 무효화
                 self._invalidate_cache(key)
         return None
 
@@ -218,21 +213,6 @@ class PatternAnalyzer:
         return hashlib.sha256(data_str.encode()).hexdigest()
 
     @safe_execute
-    def _cache_result(self, key: str, result: Dict[str, Any]):
-        """
-        결과 캐싱
-
-        Args:
-            key: 캐시 키
-            result: 캐시할 결과
-        """
-        with self.cache_lock:
-            self._cache[key] = result
-            self._cache_timestamps[key] = time.time()
-            self._cache_hashes[key] = self._calculate_data_hash()
-            logger.debug(f"결과 캐싱 완료: {key}")
-
-    @safe_execute
     @log_performance
     def analyze(self) -> Dict[str, Any]:
         """패턴 분석 수행"""
@@ -244,7 +224,7 @@ class PatternAnalyzer:
             cache_key = 'full_analysis'
             cached_result = self._get_cached_result(cache_key)
             if cached_result is not None:
-                logger.info("전체 분석 완료 (캐시 사용)")
+                logger.info("분석 완료 (캐시)")
                 return cached_result
 
             # 분석 작업 정의
@@ -280,18 +260,19 @@ class PatternAnalyzer:
                         result = future.result()
                         if result is not None:
                             results[task_name] = result
+                            logger.info(f"{task_name} 완료")
                     except Exception as e:
-                        logger.error(f"{task_name} 분석 실패: {str(e)}")
+                        logger.error(f"{task_name} 실패: {str(e)}")
                         continue
 
             # 결과 캐싱
             if results:
                 self._cache_result(cache_key, results)
-                logger.info("전체 패턴 분석 완료")
+                logger.info("분석 완료")
             return results
 
         except Exception as e:
-            logger.error(f"패턴 분석 실패: {str(e)}")
+            logger.error(f"분석 실패: {str(e)}")
             raise
 
     @safe_execute
@@ -301,7 +282,6 @@ class PatternAnalyzer:
         cache_key = 'frequency'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
-            logger.info("빈도 분석 완료 (캐시 사용)")
             return cached_result
         
         # 빈도 계산
@@ -329,7 +309,6 @@ class PatternAnalyzer:
             'expected_frequency': float(expected_freq)
         }
         
-        logger.info("빈도 분석 완료")
         self._cache_result(cache_key, result)
         return result
 
@@ -405,7 +384,6 @@ class PatternAnalyzer:
         cache_key = 'range'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
-            logger.info("구간 분포 분석 완료 (캐시 사용)")
             return cached_result
             
         range_counts = {i: 0 for i in range(1, 6)}
@@ -423,7 +401,6 @@ class PatternAnalyzer:
             'range_probabilities': range_probabilities
         }
         
-        logger.info("구간 분포 분석 완료")
         self._cache_result(cache_key, result)
         return result
 
@@ -559,6 +536,7 @@ class PatternAnalyzer:
         
         # 전체 결과 캐싱 및 반환
         self._cache_result(cache_key, full_result)
+        logger.info("마코프 완료")
         return full_result
 
     @safe_execute
