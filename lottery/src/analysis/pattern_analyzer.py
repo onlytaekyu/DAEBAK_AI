@@ -401,10 +401,18 @@ class PatternAnalyzer:
             for num in numbers:
                 range_idx = (num - 1) // 10
                 range_counts[range_idx + 1] += 1
-                
-        self.range_stats['range_counts'] = range_counts
-        self._cache_result(cache_key, self.range_stats)
-        return self.range_stats
+        
+        # 확률 계산 추가
+        total = sum(range_counts.values())
+        range_probabilities = {k: float(v)/total for k, v in range_counts.items()}
+        
+        result = {
+            'range_counts': range_counts,
+            'range_probabilities': range_probabilities  # 확률 추가
+        }
+        
+        self._cache_result(cache_key, result)
+        return result
 
     @safe_execute
     @log_performance
@@ -515,7 +523,8 @@ class PatternAnalyzer:
                         'probability': float(transition_matrix[i, j])
                     })
         
-        result = {
+        # 전체 결과 계산 (내부 처리용)
+        full_result = {
             'transition_matrix': transition_matrix.tolist(),
             'high_probability_transitions': high_probability_transitions,
             'eigenvalues': eigenvalues.tolist(),
@@ -524,8 +533,20 @@ class PatternAnalyzer:
             'threshold': float(threshold)
         }
         
-        self._cache_result(cache_key, result)
-        return result
+        # 로그 출력용 결과 (5개만 제한)
+        if self.logger.level <= logging.DEBUG:
+            log_result = {
+                'transition_matrix_sample': [row[:5] for row in transition_matrix.tolist()[:5]],  # 5x5 샘플만
+                'high_probability_transitions': high_probability_transitions[:5],  # 5개만
+                'eigenvalues': eigenvalues.tolist()[:5],  # 5개만
+                'stationary_distribution': stationary_dist.tolist()[:5],  # 5개만
+                'threshold': float(threshold)
+            }
+            self.logger.debug(f"마코프 체인 분석 결과 (샘플): {log_result}")
+        
+        # 전체 결과 캐싱 및 반환
+        self._cache_result(cache_key, full_result)
+        return full_result
 
     @safe_execute
     @log_performance
@@ -558,15 +579,27 @@ class PatternAnalyzer:
                 if 1 <= period <= 45:
                     periodic_nums.append(period)
         
-        result = {
+        # 전체 결과 계산 (내부 처리용)
+        full_result = {
             'frequencies': [float(f) for f in frequencies],
             'amplitudes': [float(m) for m in amplitudes],
             'significant_frequencies': [float(f) for f in significant_freqs],
             'periodic_numbers': sorted(list(set(periodic_nums)))
         }
         
-        self._cache_result(cache_key, result)
-        return result
+        # 로그 출력용 결과 (5개만 제한)
+        if self.logger.level <= logging.DEBUG:
+            log_result = {
+                'frequencies': [float(f) for f in frequencies[:5]],  # 처음 5개만 출력
+                'amplitudes': [float(m) for m in amplitudes[:5]],    # 처음 5개만 출력
+                'significant_frequencies': [float(f) for f in significant_freqs[:5]],
+                'periodic_numbers': sorted(list(set(periodic_nums)))[:5]
+            }
+            self.logger.debug(f"푸리에 분석 결과 (샘플): {log_result}")
+        
+        # 전체 결과 캐싱 및 반환
+        self._cache_result(cache_key, full_result)
+        return full_result
 
     @safe_execute
     @log_performance
@@ -616,7 +649,8 @@ class PatternAnalyzer:
         
         average_duplication_gap = float(np.mean(duplication_gaps)) if duplication_gaps else 0
         
-        result = {
+        # 전체 결과 계산 (내부 처리용)
+        full_result = {
             'duplicate_patterns': duplicate_patterns,
             'pattern_details': pattern_details,
             'statistics': {
@@ -626,8 +660,30 @@ class PatternAnalyzer:
             }
         }
         
-        self._cache_result(cache_key, result)
-        return result
+        # 로그 출력용 결과 (5개만 제한)
+        if self.logger.level <= logging.DEBUG:
+            # 패턴 5개만 선택
+            patterns_sample = {}
+            for i, (pattern, count) in enumerate(duplicate_patterns.items()):
+                if i >= 5: break  # 5개만
+                patterns_sample[str(pattern)] = count
+            
+            # 상세 정보 5개만 선택
+            details_sample = {}
+            for i, (pattern, details) in enumerate(pattern_details.items()):
+                if i >= 5: break  # 5개만
+                details_sample[str(pattern)] = details[:5] if len(details) > 5 else details
+            
+            log_result = {
+                'duplicate_patterns_sample': patterns_sample,
+                'pattern_details_sample': details_sample,
+                'statistics': full_result['statistics']
+            }
+            self.logger.debug(f"중복 패턴 분석 결과 (샘플): {log_result}")
+        
+        # 전체 결과 캐싱 및 반환
+        self._cache_result(cache_key, full_result)
+        return full_result
 
     @safe_execute
     @log_performance
@@ -671,13 +727,32 @@ class PatternAnalyzer:
                 'non_appearances': non_appearances
             }
         
-        result = {
+        # 전체 결과 계산 (내부 처리용)
+        full_result = {
             'pattern_counts': pattern_counts,
             'number_patterns': number_patterns
         }
         
-        self._cache_result(cache_key, result)
-        return result
+        # 로그 출력용 결과 (5개만 제한)
+        if self.logger.level <= logging.DEBUG:
+            log_patterns = {}
+            for num in range(1, 6):  # 처음 5개 번호만
+                if num in number_patterns:
+                    log_patterns[num] = {
+                        'appearances': number_patterns[num]['appearances'][:5],  # 5개만
+                        'gaps': number_patterns[num]['gaps'][:5],  # 5개만
+                        'consecutive_count': number_patterns[num]['consecutive_count'],
+                        'non_appearances': number_patterns[num]['non_appearances']
+                    }
+            log_result = {
+                'pattern_counts': pattern_counts,
+                'number_patterns_sample': log_patterns  # 샘플 데이터만 로그에 출력
+            }
+            self.logger.debug(f"번호 패턴 분석 결과 (샘플): {log_result}")
+        
+        # 전체 결과 캐싱 및 반환
+        self._cache_result(cache_key, full_result)
+        return full_result
 
     @safe_execute
     @log_performance
