@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from scipy import stats
 from scipy.fft import fft
 from sklearn.preprocessing import StandardScaler
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import torch.nn.functional as F
 from dataclasses import dataclass
@@ -182,24 +182,26 @@ class PatternAnalyzer:
         """
         with self.cache_lock:
             if key in self._cache:
-                # 캐시 유효 시간 확인
+                # 테스트 모드에서는 캐시 유효성 검사 생략
+                if self.config.get('testing_mode', False):
+                    return self._cache[key]
+                
+                # 일반 모드에서는 캐시 유효 시간 및 데이터 해시 확인
                 if time.time() - self._cache_timestamps[key] < self.pattern_config.cache_ttl:
-                    # 데이터 해시 확인
                     current_hash = self._calculate_data_hash()
                     if current_hash == self._cache_hashes.get(key):
-                        logger.debug(f"캐시된 결과 사용: {key}")
                         return self._cache[key]
-                    else:
-                        # 데이터가 변경된 경우 캐시 무효화
-                        del self._cache[key]
-                        del self._cache_timestamps[key]
-                        del self._cache_hashes[key]
-                else:
-                    # 캐시 만료
-                    del self._cache[key]
-                    del self._cache_timestamps[key]
-                    del self._cache_hashes[key]
+                
+                # 캐시 무효화
+                self._invalidate_cache(key)
         return None
+
+    def _invalidate_cache(self, key: str):
+        """캐시 무효화"""
+        if key in self._cache:
+            del self._cache[key]
+            del self._cache_timestamps[key]
+            del self._cache_hashes[key]
 
     def _calculate_data_hash(self) -> str:
         """
@@ -233,12 +235,7 @@ class PatternAnalyzer:
     @safe_execute
     @log_performance
     def analyze(self) -> Dict[str, Any]:
-        """
-        패턴 분석 수행
-
-        Returns:
-            분석 결과 딕셔너리
-        """
+        """패턴 분석 수행"""
         if self.data is None:
             raise ValueError("분석할 데이터가 없습니다.")
 
@@ -247,11 +244,10 @@ class PatternAnalyzer:
             cache_key = 'full_analysis'
             cached_result = self._get_cached_result(cache_key)
             if cached_result is not None:
-                logger.info("캐시된 분석 결과 사용")
+                logger.info("전체 분석 완료 (캐시 사용)")
                 return cached_result
 
-            # 분석 작업 실행
-            results = {}
+            # 분석 작업 정의
             analysis_tasks = [
                 ('frequency', self._analyze_frequency),
                 ('sequence', self._analyze_sequence_patterns),
@@ -268,17 +264,30 @@ class PatternAnalyzer:
                 ('robust', self._analyze_robust_stats)
             ]
 
-            # 작업 실행
-            for task_name, task_func in analysis_tasks:
-                try:
-                    result = task_func()
-                    results[task_name] = result
-                except Exception as e:
-                    logger.error(f"분석 작업 실패: {task_name}, 오류: {e}")
+            # 병렬 처리로 작업 실행
+            results = {}
+            with ThreadPoolExecutor(max_workers=self.pattern_config.num_workers) as executor:
+                # 모든 작업 동시 제출
+                future_to_task = {
+                    executor.submit(task_func): (task_name, task_func) 
+                    for task_name, task_func in analysis_tasks
+                }
+                
+                # 완료된 작업 처리
+                for future in as_completed(future_to_task):
+                    task_name, _ = future_to_task[future]
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            results[task_name] = result
+                    except Exception as e:
+                        logger.error(f"{task_name} 분석 실패: {str(e)}")
+                        continue
 
             # 결과 캐싱
-            self._cache_result(cache_key, results)
-            logger.info("패턴 분석 완료")
+            if results:
+                self._cache_result(cache_key, results)
+                logger.info("전체 패턴 분석 완료")
             return results
 
         except Exception as e:
@@ -292,6 +301,7 @@ class PatternAnalyzer:
         cache_key = 'frequency'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
+            logger.info("빈도 분석 완료 (캐시 사용)")
             return cached_result
         
         # 빈도 계산
@@ -319,6 +329,7 @@ class PatternAnalyzer:
             'expected_frequency': float(expected_freq)
         }
         
+        logger.info("빈도 분석 완료")
         self._cache_result(cache_key, result)
         return result
 
@@ -394,6 +405,7 @@ class PatternAnalyzer:
         cache_key = 'range'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
+            logger.info("구간 분포 분석 완료 (캐시 사용)")
             return cached_result
             
         range_counts = {i: 0 for i in range(1, 6)}
@@ -402,15 +414,16 @@ class PatternAnalyzer:
                 range_idx = (num - 1) // 10
                 range_counts[range_idx + 1] += 1
         
-        # 확률 계산 추가
+        # 확률 계산
         total = sum(range_counts.values())
         range_probabilities = {k: float(v)/total for k, v in range_counts.items()}
         
         result = {
             'range_counts': range_counts,
-            'range_probabilities': range_probabilities  # 확률 추가
+            'range_probabilities': range_probabilities
         }
         
+        logger.info("구간 분포 분석 완료")
         self._cache_result(cache_key, result)
         return result
 
