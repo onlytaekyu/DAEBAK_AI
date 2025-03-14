@@ -224,55 +224,55 @@ class PatternAnalyzer:
             cache_key = 'full_analysis'
             cached_result = self._get_cached_result(cache_key)
             if cached_result is not None:
-                logger.info("분석 완료 (캐시)")
+                logger.info("캐시 데이터 완료")
                 return cached_result
 
             # 분석 작업 정의
             analysis_tasks = [
                 ('frequency', self._analyze_frequency),
-                ('sequence', self._analyze_sequence_patterns),
-                ('oddeven', self._analyze_oddeven_patterns),
-                ('range', self._analyze_range_distribution),
-                ('sum', self._analyze_sum_patterns),
-                ('gap', self._analyze_gap_patterns),
-                ('markov', self._analyze_markov_chain),
+                ('sequence_patterns', self._analyze_sequence_patterns),
+                ('oddeven_patterns', self._analyze_oddeven_patterns),
+                ('range_distribution', self._analyze_range_distribution),
+                ('sum_patterns', self._analyze_sum_patterns),
+                ('gap_patterns', self._analyze_gap_patterns),
+                ('markov_chain', self._analyze_markov_chain),
                 ('fourier', self._analyze_fourier),
-                ('duplicate', self._analyze_duplicate_patterns),
-                ('number', self._analyze_number_patterns),
-                ('combination', self._analyze_combination_stats),
-                ('moving', self._analyze_moving_averages),
-                ('robust', self._analyze_robust_stats)
+                ('duplicate_patterns', self._analyze_duplicate_patterns),
+                ('number_patterns', self._analyze_number_patterns),
+                ('combination_stats', self._analyze_combination_stats),
+                ('moving_averages', self._analyze_moving_averages),
+                ('robust_stats', self._analyze_robust_stats)
             ]
 
             # 병렬 처리로 작업 실행
             results = {}
             with ThreadPoolExecutor(max_workers=self.pattern_config.num_workers) as executor:
                 # 모든 작업 동시 제출
-                future_to_task = {
-                    executor.submit(task_func): (task_name, task_func) 
+                futures = {
+                    executor.submit(task_func): task_name
                     for task_name, task_func in analysis_tasks
                 }
                 
                 # 완료된 작업 처리
-                for future in as_completed(future_to_task):
-                    task_name, _ = future_to_task[future]
+                for future in as_completed(futures):
+                    task_name = futures[future]
                     try:
                         result = future.result()
                         if result is not None:
                             results[task_name] = result
                             logger.info(f"{task_name} 완료")
                     except Exception as e:
-                        logger.error(f"{task_name} 실패: {str(e)}")
+                        logger.error(f"{task_name} 오류")
                         continue
 
             # 결과 캐싱
             if results:
                 self._cache_result(cache_key, results)
-                logger.info("분석 완료")
+                logger.info("전체 완료")
             return results
 
         except Exception as e:
-            logger.error(f"분석 실패: {str(e)}")
+            logger.error("전체 오류")
             raise
 
     @safe_execute
@@ -292,21 +292,21 @@ class PatternAnalyzer:
         
         # 확률 계산
         total_count = sum(frequency.values())
-        probabilities = {num: float(count)/total_count for num, count in frequency.items()}
+        probabilities = {num: round(float(count)/total_count, 4) for num, count in frequency.items()}
         
         # 카이제곱 검정
         expected_freq = total_count / 45  # 균등 분포 가정
         chi2_stat = sum((count - expected_freq)**2 / expected_freq for count in frequency.values())
         p_value = 1 - stats.chi2.cdf(chi2_stat, df=44)  # 자유도 = 45-1
         
-        # 결과 구조화
+        # 결과 구조화 (간단하게)
         result = {
-            'frequency': {int(k): int(v) for k, v in frequency.items()},
-            'probabilities': {int(k): float(v) for k, v in probabilities.items()},
-            'chi2_stat': float(chi2_stat),
-            'p_value': float(p_value),
-            'total_count': int(total_count),
-            'expected_frequency': float(expected_freq)
+            'frequency': {int(k): int(v) for k, v in sorted(frequency.items())},
+            'probabilities': {int(k): float(v) for k, v in sorted(probabilities.items())},
+            'stats': {
+                'chi2': round(float(chi2_stat), 4),
+                'p_value': round(float(p_value), 4)
+            }
         }
         
         self._cache_result(cache_key, result)
@@ -346,32 +346,24 @@ class PatternAnalyzer:
     @safe_execute
     @log_performance
     def _analyze_oddeven_patterns(self) -> Dict[str, Any]:
-        """홀/짝 패턴 분석"""
-        cache_key = 'oddeven'
+        """홀짝 패턴 분석"""
+        cache_key = 'oddeven_patterns'
         cached_result = self._get_cached_result(cache_key)
         if cached_result:
             return cached_result
-        
-        pattern_counts = {}
-        pattern_probabilities = {}
-        
-        # 각 회차별 홀/짝 패턴 분석
+
+        patterns = []
         for numbers in self.data['numbers']:
-            odd_count = sum(1 for n in numbers if n % 2 == 1)
-            even_count = 6 - odd_count
-            pattern = 'O' * odd_count + 'E' * even_count
-            
-            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
-            
-        # 확률 계산
-        total_count = len(self.data['numbers'])
-        for pattern, count in pattern_counts.items():
-            pattern_probabilities[pattern] = float(count) / total_count
+            pattern = ''.join(['O' if n % 2 else 'E' for n in numbers])
+            patterns.append(pattern)
+
+        pattern_counts = Counter(patterns)
+        total = len(patterns)
         
+        # 결과 구조화 (간단하게)
         result = {
-            'pattern_counts': {k: int(v) for k, v in pattern_counts.items()},
-            'pattern_probabilities': {k: float(v) for k, v in pattern_probabilities.items()},
-            'total_count': int(total_count)
+            'patterns': {k: {'count': v, 'prob': round(v/total, 4)} 
+                        for k, v in sorted(pattern_counts.items(), key=lambda x: x[1], reverse=True)}
         }
         
         self._cache_result(cache_key, result)
@@ -1235,12 +1227,12 @@ class PatternAnalyzer:
         """분석 결과 저장"""
         results = {
             'frequency': self.frequency_stats,
-            'sequence': self.sequence_stats,
-            'oddeven': self.oddeven_stats,
-            'range': self.range_stats,
-            'sum': self.sum_stats,
-            'gap': self.gap_stats,
-            'markov': self.markov_stats,
+            'sequence_patterns': self.sequence_stats,
+            'oddeven_patterns': self.oddeven_stats,
+            'range_distribution': self.range_stats,
+            'sum_patterns': self.sum_stats,
+            'gap_patterns': self.gap_stats,
+            'markov_chain': self.markov_stats,
             'fourier': self.fourier_stats
         }
 
@@ -1256,12 +1248,12 @@ class PatternAnalyzer:
         results = np.load(filepath, allow_pickle=True).item()
 
         self.frequency_stats = results['frequency']
-        self.sequence_stats = results['sequence']
-        self.oddeven_stats = results['oddeven']
-        self.range_stats = results['range']
-        self.sum_stats = results['sum']
-        self.gap_stats = results['gap']
-        self.markov_stats = results['markov']
+        self.sequence_stats = results['sequence_patterns']
+        self.oddeven_stats = results['oddeven_patterns']
+        self.range_stats = results['range_distribution']
+        self.sum_stats = results['sum_patterns']
+        self.gap_stats = results['gap_patterns']
+        self.markov_stats = results['markov_chain']
         self.fourier_stats = results['fourier']
 
         logger.info(f'분석 결과 로드 완료: {filepath}')
@@ -1314,14 +1306,14 @@ if __name__ == "__main__":
     results = analyzer.analyze()
 
     print("\n빈도 분석 결과:")
-    print(f"카이제곱 통계량: {results['frequency']['chi2_stat']:.2f}")
-    print(f"p-값: {results['frequency']['p_value']:.4f}")
+    print(f"카이제곱 통계량: {results['frequency']['stats']['chi2']:.2f}")
+    print(f"p-값: {results['frequency']['stats']['p_value']:.4f}")
 
     print("\n연속 패턴 분석 결과:")
     print(f"연속 번호 출현 확률: {results['sequence_patterns']['consecutive_probability']:.4f}")
 
     print("\n홀짝 패턴 분석 결과:")
-    print("패턴별 확률:", results['oddeven_patterns']['pattern_probabilities'])
+    print("패턴별 확률:", results['oddeven_patterns']['patterns'])
 
     print("\n구간 분포 분석 결과:")
     print("구간별 확률:", results['range_distribution']['range_probabilities'])
