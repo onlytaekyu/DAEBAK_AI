@@ -51,7 +51,14 @@ class TestPatternAnalyzer(unittest.TestCase):
                 'use_gpu': torch.cuda.is_available(),
                 'num_workers': 4,
                 'batch_size': 32,
-                'cache_size': 1000
+                'cache_size': 1000,
+                'cache_ttl': 300,
+                'use_amp': True,
+                'num_streams': 3,
+                'memory_fraction': 0.8,
+                'enable_jit': True,
+                'enable_fusion': True,
+                'enable_profiling': False
             }
         }
         cls.config = Config(config_dict)
@@ -76,6 +83,15 @@ class TestPatternAnalyzer(unittest.TestCase):
         self.assertEqual(self.analyzer.config, self.config)
         self.assertIsNotNone(self.analyzer.data)
         self.assertIsNotNone(self.analyzer.pattern_config)
+        
+        # 새로운 설정 옵션 테스트
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'cache_ttl'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'use_amp'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'num_streams'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'memory_fraction'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'enable_jit'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'enable_fusion'))
+        self.assertTrue(hasattr(self.analyzer.pattern_config, 'enable_profiling'))
 
     def test_analyze(self):
         """전체 분석 테스트"""
@@ -90,10 +106,10 @@ class TestPatternAnalyzer(unittest.TestCase):
         self.assertIn('gap_patterns', results)
         self.assertIn('markov_chain', results)
         self.assertIn('fourier', results)
-        self.assertIn('duplicate_patterns', results)
-        self.assertIn('number_patterns', results)
         
         # 새로운 분석 결과 테스트
+        self.assertIn('duplicate_patterns', results)
+        self.assertIn('number_patterns', results)
         self.assertIn('combination_stats', results)
         self.assertIn('moving_averages', results)
         self.assertIn('robust_stats', results)
@@ -321,45 +337,114 @@ class TestPatternAnalyzer(unittest.TestCase):
         result = self.analyzer._analyze_combination_stats()
         
         # 결과 검증
-        self.assertIn('basic_stats', result)
-        self.assertIn('time_series_stats', result)
+        self.assertIn('combination_counts', result)
+        self.assertIn('combination_probabilities', result)
+        self.assertIn('most_common_combinations', result)
         
-        # 기본 통계량 검증
-        stats = result['basic_stats']
-        self.assertIn('variance', stats)
-        self.assertIn('std_dev', stats)
-        self.assertIn('range', stats)
-        self.assertIn('median', stats)
+        # 조합 크기 검증
+        for combo in result['most_common_combinations']:
+            self.assertEqual(len(combo), 6)
 
     def test_moving_averages(self):
         """이동 평균 분석 테스트"""
         result = self.analyzer._analyze_moving_averages()
         
         # 결과 검증
-        self.assertIn('moving_averages', result)
-        self.assertIn('trend_direction', result)
+        self.assertIn('ma_values', result)
+        self.assertIn('ma_trends', result)
+        self.assertIn('ma_crossovers', result)
         
-        # 이동 평균 기간 검증
-        for period in [5, 10, 20]:
-            self.assertIn(f'ma_{period}', result['moving_averages'])
+        # 이동 평균 값 범위 검증
+        for ma in result['ma_values'].values():
+            self.assertTrue(all(1 <= val <= 45 for val in ma))
 
     def test_robust_stats(self):
-        """로버스트 통계 분석 테스트"""
+        """강건 통계 분석 테스트"""
         result = self.analyzer._analyze_robust_stats()
         
         # 결과 검증
-        self.assertIn('robust_stats', result)
-        self.assertIn('winsorized_stats', result)
-        self.assertIn('clean_stats', result)
-        self.assertIn('outlier_count', result)
+        self.assertIn('median', result)
+        self.assertIn('iqr', result)
+        self.assertIn('outliers', result)
+        self.assertIn('robust_correlation', result)
         
-        # 로버스트 통계량 검증
-        robust = result['robust_stats']
-        self.assertIn('median', robust)
-        self.assertIn('q1', robust)
-        self.assertIn('q3', robust)
-        self.assertIn('iqr', robust)
-        self.assertIn('mad', robust)
+        # 통계값 범위 검증
+        self.assertGreaterEqual(result['median'], 1)
+        self.assertLessEqual(result['median'], 45)
+        self.assertGreaterEqual(result['iqr'], 0)
+
+    def test_duplicate_patterns(self):
+        """중복 패턴 분석 테스트"""
+        result = self.analyzer._analyze_duplicate_patterns()
+        
+        # 결과 검증
+        self.assertIn('duplicate_counts', result)
+        self.assertIn('duplicate_probabilities', result)
+        self.assertIn('most_common_duplicates', result)
+        
+        # 확률 범위 검증
+        for prob in result['duplicate_probabilities'].values():
+            self.assertGreaterEqual(prob, 0)
+            self.assertLessEqual(prob, 1)
+
+    def test_number_patterns(self):
+        """번호 패턴 분석 테스트"""
+        result = self.analyzer._analyze_number_patterns()
+        
+        # 결과 검증
+        self.assertIn('pattern_counts', result)
+        self.assertIn('pattern_probabilities', result)
+        self.assertIn('significant_patterns', result)
+        
+        # 패턴 유효성 검증
+        for pattern in result['significant_patterns']:
+            self.assertIsInstance(pattern, (list, tuple))
+            self.assertTrue(all(1 <= num <= 45 for num in pattern))
+
+    def test_performance_optimization(self):
+        """성능 최적화 테스트"""
+        # 캐시 테스트
+        cache_key = 'test_cache'
+        test_data = {'test': 'data'}
+        
+        # 캐시 저장
+        self.analyzer._cache_result(cache_key, test_data)
+        
+        # 캐시 조회
+        cached_result = self.analyzer._get_cached_result(cache_key)
+        self.assertEqual(cached_result, test_data)
+        
+        # 캐시 만료 테스트
+        time.sleep(self.analyzer.pattern_config.cache_ttl + 1)
+        expired_result = self.analyzer._get_cached_result(cache_key)
+        self.assertIsNone(expired_result)
+        
+        # GPU 메모리 관리 테스트
+        if torch.cuda.is_available():
+            self.assertIsNotNone(self.analyzer.cuda_optimizer)
+            self.assertIsNotNone(self.analyzer.tensor_cache)
+            self.assertIsNotNone(self.analyzer.inference_buffer)
+            self.assertIsNotNone(self.analyzer.memory_manager)
+
+    def test_visualization(self):
+        """시각화 테스트"""
+        # 그래프 저장 디렉토리 생성
+        graph_dir = Path('lottery/data/results/graph')
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 새로운 패턴 그래프 생성
+        self.analyzer._plot_duplicate_patterns(str(graph_dir / 'duplicate_patterns.png'))
+        self.analyzer._plot_number_patterns(str(graph_dir / 'number_patterns.png'))
+        self.analyzer._plot_combination_stats(str(graph_dir / 'combination_stats.png'))
+        self.analyzer._plot_moving_averages(str(graph_dir / 'moving_averages.png'))
+        self.analyzer._plot_robust_stats(str(graph_dir / 'robust_stats.png'))
+        
+        # 파일 존재 확인
+        self.assertTrue((graph_dir / 'duplicate_patterns.png').exists())
+        self.assertTrue((graph_dir / 'number_patterns.png').exists())
+        self.assertTrue((graph_dir / 'combination_stats.png').exists())
+        self.assertTrue((graph_dir / 'moving_averages.png').exists())
+        self.assertTrue((graph_dir / 'robust_stats.png').exists())
 
 if __name__ == '__main__':
     unittest.main()

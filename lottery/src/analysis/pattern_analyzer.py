@@ -14,7 +14,7 @@
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Union
 import logging
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -29,11 +29,21 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from datetime import datetime
 import time
+import json
+import pickle
+from tqdm import tqdm
+import threading
+from queue import PriorityQueue
+import hashlib
+from functools import wraps
 
 from lottery.src.utils.config import Config
+from shared.cuda_optimizers import CUDAOptimizer, TensorCache, InferenceBuffer
+from shared.memory_manager import MemoryManager
+from shared.error_handler import safe_execute, log_performance, setup_logger
 
 # 로거 설정
-logger = logging.getLogger(__name__)
+logger = setup_logger('pattern_analyzer')
 
 @dataclass
 class PatternAnalysisConfig:
@@ -46,7 +56,24 @@ class PatternAnalysisConfig:
     num_workers: int = 4
     batch_size: int = 32
     cache_size: int = 1000
-    cache_ttl: float = 300  # Added for the new cache method
+    cache_ttl: float = 300
+    use_amp: bool = True
+    num_streams: int = 3
+    memory_fraction: float = 0.8
+    enable_jit: bool = True
+    enable_fusion: bool = True
+    enable_profiling: bool = False
+
+def safe_execute(func):
+    """안전한 실행을 위한 데코레이터"""
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            self.logger.error(f"{func.__name__} 실행 중 오류 발생: {str(e)}")
+            return None
+    return wrapper
 
 class PatternAnalyzer:
     """로또 번호 패턴 분석"""
@@ -66,20 +93,43 @@ class PatternAnalyzer:
         self.config = config
         self.pattern_config = PatternAnalysisConfig(**config.get('pattern_analysis', {}))
         self.data = data
+        self.logger = setup_logger('pattern_analyzer')
 
         # 분석 결과 저장
-        self.frequency_stats = None
-        self.sequence_stats = None
-        self.oddeven_stats = None
-        self.range_stats = None
-        self.sum_stats = None
-        self.gap_stats = None
-        self.markov_stats = None
-        self.fourier_stats = None
-        self.number_patterns = None
+        self.frequency_stats = {'frequency': {}}
+        self.sequence_stats = {'sequence_counts': {}}
+        self.oddeven_stats = {'pattern_counts': {}}
+        self.range_stats = {'range_counts': {}}
+        self.sum_stats = {'sum_mean': 0, 'sum_std': 0}
+        self.gap_stats = {'gap_mean': 0, 'gap_std': 0}
+        self.markov_stats = {'transition_matrix': None}
+        self.fourier_stats = {'frequencies': [], 'amplitudes': []}
+        self.number_stats = {'pattern_counts': {}}
+        self.number_patterns = {'pattern_counts': {}}
+        self.duplicate_stats = {'duplicate_counts': {}}
+        self.combination_stats = {'combination_counts': {}}
+        self.moving_stats = {'ma5': [], 'ma10': [], 'ma20': []}
+        self.robust_stats = {'median': 0, 'mad': 0, 'iqr': 0}
+
+        # CUDA 최적화 초기화
+        self.cuda_optimizer = CUDAOptimizer({
+            'use_amp': self.pattern_config.use_amp,
+            'num_streams': self.pattern_config.num_streams,
+            'memory_fraction': self.pattern_config.memory_fraction,
+            'enable_jit': self.pattern_config.enable_jit,
+            'enable_fusion': self.pattern_config.enable_fusion,
+            'enable_profiling': self.pattern_config.enable_profiling
+        })
+        
+        # 텐서 캐시 및 추론 버퍼 초기화
+        self.tensor_cache = TensorCache()
+        self.inference_buffer = InferenceBuffer()
+        
+        # 메모리 관리자 초기화
+        self.memory_manager = MemoryManager()
 
         # GPU 설정
-        self.device = torch.device('cuda' if torch.cuda.is_available() and self.pattern_config.use_gpu else 'cpu')
+        self.device = self.cuda_optimizer.device
 
         # 캐시 초기화
         self._init_cache()
@@ -95,12 +145,31 @@ class PatternAnalyzer:
 
         # 스레드 풀 초기화
         self.executor = ThreadPoolExecutor(max_workers=self.pattern_config.num_workers)
+        
+        # 분석 작업 큐
+        self.analysis_queue = PriorityQueue()
+        
+        # 스레드 안전성을 위한 락
+        self.cache_lock = threading.Lock()
+        self.result_lock = threading.Lock()
+        
+        # 성능 모니터링
+        self.performance_metrics = {
+            'analysis_times': [],
+            'memory_usage': [],
+            'gpu_usage': [],
+            'errors': []
+        }
+
+        self.logger.info("패턴 분석기 초기화 완료")
 
     def _init_cache(self):
         """캐시 초기화"""
         self._cache = {}
         self._cache_timestamps = {}
+        self._cache_hashes = {}
 
+    @safe_execute
     def _get_cached_result(self, key: str) -> Optional[Dict[str, Any]]:
         """
         캐시된 결과 조회
@@ -111,17 +180,42 @@ class PatternAnalyzer:
         Returns:
             캐시된 결과 또는 None
         """
-        if key in self._cache:
-            # 캐시 유효 시간 확인
-            if time.time() - self._cache_timestamps[key] < self.pattern_config.cache_ttl:
-                logger.debug(f"캐시된 결과 사용: {key}")
-                return self._cache[key]
-            else:
-                # 캐시 만료
-                del self._cache[key]
-                del self._cache_timestamps[key]
+        with self.cache_lock:
+            if key in self._cache:
+                # 캐시 유효 시간 확인
+                if time.time() - self._cache_timestamps[key] < self.pattern_config.cache_ttl:
+                    # 데이터 해시 확인
+                    current_hash = self._calculate_data_hash()
+                    if current_hash == self._cache_hashes.get(key):
+                        logger.debug(f"캐시된 결과 사용: {key}")
+                        return self._cache[key]
+                    else:
+                        # 데이터가 변경된 경우 캐시 무효화
+                        del self._cache[key]
+                        del self._cache_timestamps[key]
+                        del self._cache_hashes[key]
+                else:
+                    # 캐시 만료
+                    del self._cache[key]
+                    del self._cache_timestamps[key]
+                    del self._cache_hashes[key]
         return None
 
+    def _calculate_data_hash(self) -> str:
+        """
+        데이터 해시 계산
+        
+        Returns:
+            데이터 해시값
+        """
+        if self.data is None:
+            return ""
+        
+        # 데이터프레임을 문자열로 변환하여 해시 계산
+        data_str = self.data.to_string()
+        return hashlib.sha256(data_str.encode()).hexdigest()
+
+    @safe_execute
     def _cache_result(self, key: str, result: Dict[str, Any]):
         """
         결과 캐싱
@@ -130,10 +224,14 @@ class PatternAnalyzer:
             key: 캐시 키
             result: 캐시할 결과
         """
-        self._cache[key] = result
-        self._cache_timestamps[key] = time.time()
-        logger.debug(f"결과 캐싱 완료: {key}")
+        with self.cache_lock:
+            self._cache[key] = result
+            self._cache_timestamps[key] = time.time()
+            self._cache_hashes[key] = self._calculate_data_hash()
+            logger.debug(f"결과 캐싱 완료: {key}")
 
+    @safe_execute
+    @log_performance
     def analyze(self) -> Dict[str, Any]:
         """
         패턴 분석 수행
@@ -152,39 +250,31 @@ class PatternAnalyzer:
                 logger.info("캐시된 분석 결과 사용")
                 return cached_result
 
-            # 병렬로 분석 수행
-            futures = [
-                self.executor.submit(self._analyze_frequency),
-                self.executor.submit(self._analyze_sequence_patterns),
-                self.executor.submit(self._analyze_oddeven_patterns),
-                self.executor.submit(self._analyze_range_distribution),
-                self.executor.submit(self._analyze_sum_patterns),
-                self.executor.submit(self._analyze_gap_patterns),
-                self.executor.submit(self._analyze_markov_chain),
-                self.executor.submit(self._analyze_fourier),
-                self.executor.submit(self._analyze_duplicate_patterns),
-                self.executor.submit(self._analyze_number_patterns),
-                self.executor.submit(self._analyze_combination_stats),
-                self.executor.submit(self._analyze_moving_averages),
-                self.executor.submit(self._analyze_robust_stats)
+            # 분석 작업 실행
+            results = {}
+            analysis_tasks = [
+                ('frequency', self._analyze_frequency),
+                ('sequence', self._analyze_sequence_patterns),
+                ('oddeven', self._analyze_oddeven_patterns),
+                ('range', self._analyze_range_distribution),
+                ('sum', self._analyze_sum_patterns),
+                ('gap', self._analyze_gap_patterns),
+                ('markov', self._analyze_markov_chain),
+                ('fourier', self._analyze_fourier),
+                ('duplicate', self._analyze_duplicate_patterns),
+                ('number', self._analyze_number_patterns),
+                ('combination', self._analyze_combination_stats),
+                ('moving', self._analyze_moving_averages),
+                ('robust', self._analyze_robust_stats)
             ]
 
-            # 결과 수집
-            results = {
-                'frequency': futures[0].result(),
-                'sequence_patterns': futures[1].result(),
-                'oddeven_patterns': futures[2].result(),
-                'range_distribution': futures[3].result(),
-                'sum_patterns': futures[4].result(),
-                'gap_patterns': futures[5].result(),
-                'markov_chain': futures[6].result(),
-                'fourier': futures[7].result(),
-                'duplicate_patterns': futures[8].result(),
-                'number_patterns': futures[9].result(),
-                'combination_stats': futures[10].result(),
-                'moving_averages': futures[11].result(),
-                'robust_stats': futures[12].result()
-            }
+            # 작업 실행
+            for task_name, task_func in analysis_tasks:
+                try:
+                    result = task_func()
+                    results[task_name] = result
+                except Exception as e:
+                    logger.error(f"분석 작업 실패: {task_name}, 오류: {e}")
 
             # 결과 캐싱
             self._cache_result(cache_key, results)
@@ -195,650 +285,429 @@ class PatternAnalyzer:
             logger.error(f"패턴 분석 실패: {str(e)}")
             raise
 
+    @safe_execute
+    @log_performance
     def _analyze_frequency(self) -> Dict[str, Any]:
-        """번호별 출현 빈도 분석"""
-        # 캐시 확인
-        cache_key = 'frequency_analysis'
+        """빈도 분석"""
+        cache_key = 'frequency'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 빈도수 계산 (GPU)
-        unique_numbers, counts = torch.unique(numbers_tensor, return_counts=True)
-        frequency = dict(zip(unique_numbers.cpu().numpy(), counts.cpu().numpy()))
-
-        # 통계량 계산
-        total_count = len(numbers_tensor.flatten())
+            
+        frequency = {}
+        for numbers in self.data['numbers']:
+            for num in numbers:
+                frequency[num] = frequency.get(num, 0) + 1
+                
+        # 확률 계산
+        total_count = sum(frequency.values())
         probabilities = {num: count/total_count for num, count in frequency.items()}
-
-        # 카이제곱 검정을 위한 데이터 준비
-        observed = np.zeros(45, dtype=np.float64)
-        # unique_numbers를 정수형으로 변환하여 인덱스로 사용
-        indices = unique_numbers.cpu().numpy().astype(np.int64) - 1
-        observed[indices] = counts.cpu().numpy().astype(np.float64)
-        expected = np.full(45, total_count / 45, dtype=np.float64)
-
-        # 카이제곱 통계량 직접 계산 (float64 타입 유지)
-        chi2_stat = np.sum((observed - expected) ** 2 / expected, dtype=np.float64)
-
-        # 자유도는 44 (45개 카테고리 - 1)
-        p_value = 1 - stats.chi2.cdf(chi2_stat, df=44)
-
+        
+        # 카이제곱 검정
+        expected_freq = total_count / 45  # 균등 분포 가정
+        chi2_stat = sum((count - expected_freq)**2 / expected_freq for count in frequency.values())
+        p_value = 1 - stats.chi2.cdf(chi2_stat, df=44)  # 자유도 = 45-1
+        
         result = {
             'frequency': frequency,
             'probabilities': probabilities,
             'chi2_stat': chi2_stat,
             'p_value': p_value
         }
-
-        # 결과 캐싱
+        
         self._cache_result(cache_key, result)
         return result
 
+    @safe_execute
+    @log_performance
     def _analyze_sequence_patterns(self) -> Dict[str, Any]:
-        """연속된 번호 패턴 분석"""
-        # 캐시 확인
-        cache_key = 'sequence_patterns'
+        """연속 패턴 분석"""
+        cache_key = 'sequence'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-        sorted_numbers = torch.sort(numbers_tensor, dim=1)[0]
-
-        # 연속된 번호 찾기 (GPU)
-        diffs = sorted_numbers[:, 1:] - sorted_numbers[:, :-1]
-        consecutive_mask = diffs == 1
-        sequence_counts = torch.sum(consecutive_mask.to(dtype=torch.float64), dim=1)
-
-        result = {
-            'sequence_counts': sequence_counts.cpu().numpy().tolist(),
-            'consecutive_probability': torch.mean(sequence_counts).item()
+            
+        sequence_counts = {}
+        consecutive_count = 0
+        total_pairs = 0
+        
+        for numbers in self.data['numbers']:
+            for i in range(len(numbers)-1):
+                seq = (numbers[i], numbers[i+1])
+                sequence_counts[seq] = sequence_counts.get(seq, 0) + 1
+                total_pairs += 1
+                if numbers[i+1] - numbers[i] == 1:
+                    consecutive_count += 1
+                    
+        consecutive_probability = consecutive_count / total_pairs if total_pairs > 0 else 0
+                
+        self.sequence_stats = {
+            'sequence_counts': sequence_counts,
+            'consecutive_probability': consecutive_probability
         }
+        
+        self._cache_result(cache_key, self.sequence_stats)
+        return self.sequence_stats
 
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
+    @log_performance
     def _analyze_oddeven_patterns(self) -> Dict[str, Any]:
         """홀짝 패턴 분석"""
-        # 캐시 확인
-        cache_key = 'oddeven_patterns'
+        cache_key = 'oddeven'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 홀짝 패턴 계산 (GPU)
-        odd_mask = numbers_tensor % 2 == 1
-        odd_counts = torch.sum(odd_mask.to(dtype=torch.float64), dim=1)
-        patterns = torch.stack([odd_counts, 6 - odd_counts], dim=1)
-
-        # 패턴 빈도 계산
-        unique_patterns, pattern_counts = torch.unique(patterns, dim=0, return_counts=True)
-        pattern_dict = {
-            tuple(pattern.cpu().numpy()): count.item()
-            for pattern, count in zip(unique_patterns, pattern_counts)
+            
+        pattern_counts = {}
+        total_count = 0
+        
+        # 패턴 카운트 초기화
+        for numbers in self.data['numbers']:
+            pattern = ''.join(['O' if n % 2 == 1 else 'E' for n in numbers])
+            pattern_counts[pattern] = pattern_counts.get(pattern, 0) + 1
+            total_count += 1
+            
+        # 패턴 확률 계산
+        pattern_probabilities = {
+            pattern: count / total_count 
+            for pattern, count in pattern_counts.items()
         }
-
+        
         result = {
-            'pattern_counts': pattern_dict,
-            'pattern_probabilities': {
-                k: v/len(numbers_array) for k, v in pattern_dict.items()
-            }
+            'pattern_counts': pattern_counts,
+            'pattern_probabilities': pattern_probabilities
         }
-
-        # 결과 캐싱
+        
         self._cache_result(cache_key, result)
         return result
 
+    @safe_execute
+    @log_performance
     def _analyze_range_distribution(self) -> Dict[str, Any]:
-        """구간별 분포 분석"""
-        # 캐시 확인
-        cache_key = 'range_distribution'
+        """구간 분포 분석"""
+        cache_key = 'range'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
+            
+        range_counts = {i: 0 for i in range(1, 6)}
+        for numbers in self.data['numbers']:
+            for num in numbers:
+                range_idx = (num - 1) // 10
+                range_counts[range_idx + 1] += 1
+                
+        self.range_stats['range_counts'] = range_counts
+        self._cache_result(cache_key, self.range_stats)
+        return self.range_stats
 
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 구간 정의
-        ranges = torch.tensor([[1,10], [11,20], [21,30], [31,40], [41,45]], device=self.device, dtype=torch.float64)
-
-        # 구간별 카운트 계산 (GPU)
-        range_counts = torch.zeros(5, device=self.device, dtype=torch.float64)
-        for i, (start, end) in enumerate(ranges):
-            mask = (numbers_tensor >= start) & (numbers_tensor <= end)
-            range_counts[i] = torch.sum(mask.to(dtype=torch.float64))
-
-        # 결과를 딕셔너리 형태로 변환
-        range_dict = {
-            f'range_{i+1}': {
-                'count': count.item(),
-                'probability': count.item() / (len(numbers_array) * 6)
-            }
-            for i, count in enumerate(range_counts)
-        }
-
-        result = {
-            'range_counts': range_dict,
-            'range_probabilities': {
-                k: v['probability'] for k, v in range_dict.items()
-            }
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
+    @log_performance
     def _analyze_sum_patterns(self) -> Dict[str, Any]:
         """합계 패턴 분석"""
-        # 캐시 확인
-        cache_key = 'sum_patterns'
+        cache_key = 'sum'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 합계 계산 (GPU)
-        sums = torch.sum(numbers_tensor, dim=1)
-
-        # 정규성 검정을 위한 데이터 준비
-        sums_np = sums.cpu().numpy().astype(np.float64)
-
-        result = {
-            'sum_mean': torch.mean(sums).item(),
-            'sum_std': torch.std(sums).item(),
-            'sum_min': torch.min(sums).item(),
-            'sum_max': torch.max(sums).item(),
-            'normality_p_value': stats.normaltest(sums_np)[1]
+            
+        sums = [sum(numbers) for numbers in self.data['numbers']]
+        
+        # 기본 통계량
+        self.sum_stats = {
+            'sum_mean': np.mean(sums),
+            'sum_std': np.std(sums),
+            'sum_min': min(sums),
+            'sum_max': max(sums)
         }
+        
+        # 정규성 검정
+        _, p_value = stats.normaltest(sums)
+        self.sum_stats['normality_p_value'] = p_value
+        
+        self._cache_result(cache_key, self.sum_stats)
+        return self.sum_stats
 
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
+    @log_performance
     def _analyze_gap_patterns(self) -> Dict[str, Any]:
         """간격 패턴 분석"""
-        # 캐시 확인
-        cache_key = 'gap_patterns'
+        cache_key = 'gap'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
+            
+        gaps = []
+        for i in range(1, len(self.data)):
+            prev_numbers = set(self.data.iloc[i-1]['numbers'])
+            curr_numbers = set(self.data.iloc[i]['numbers'])
+            gap = len(prev_numbers - curr_numbers)
+            gaps.append(gap)
+            
+        self.gap_stats['gap_mean'] = np.mean(gaps)
+        self.gap_stats['gap_std'] = np.std(gaps)
+        self._cache_result(cache_key, self.gap_stats)
+        return self.gap_stats
 
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-        sorted_numbers = torch.sort(numbers_tensor, dim=1)[0]
-
-        # 간격 계산 (GPU)
-        gaps = sorted_numbers[:, 1:] - sorted_numbers[:, :-1]
-
-        # float64 타입으로 변환하여 통계 계산
-        gaps_float64 = gaps.to(dtype=torch.float64)
-
-        result = {
-            'gap_mean': torch.mean(gaps_float64).item(),
-            'gap_std': torch.std(gaps_float64).item(),
-            'gap_min': torch.min(gaps_float64).item(),
-            'gap_max': torch.max(gaps_float64).item(),
-            'gap_median': torch.median(gaps_float64).item()
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
+    @log_performance
     def _analyze_markov_chain(self) -> Dict[str, Any]:
         """마코프 체인 분석"""
-        # 리스트 형태의 numbers를 numpy 배열로 변환
-        numbers_array = np.array(self.data['numbers'].tolist())
-
-        # 전이 행렬 계산
+        cache_key = 'markov'
+        cached_result = self._get_cached_result(cache_key)
+        if cached_result:
+            return cached_result
+            
+        # 전이 행렬 초기화
         transition_matrix = np.zeros((45, 45))
-        for row in numbers_array:
-            sorted_row = np.sort(row)
-            for i in range(len(sorted_row) - 1):
-                from_num = sorted_row[i] - 1
-                to_num = sorted_row[i + 1] - 1
+        
+        # 전이 횟수 계산
+        for numbers in self.data['numbers']:
+            for i in range(len(numbers)-1):
+                from_num = numbers[i] - 1  # 0-based index
+                to_num = numbers[i+1] - 1
                 transition_matrix[from_num, to_num] += 1
-
+                
         # 정규화
         row_sums = transition_matrix.sum(axis=1, keepdims=True)
-        transition_matrix = np.divide(transition_matrix, row_sums, where=row_sums != 0)
-
-        # 고확률 전이 찾기
-        high_prob_transitions = []
+        transition_matrix = np.divide(transition_matrix, row_sums, where=row_sums!=0)
+        
+        # 고유값과 고유벡터 계산
+        eigenvalues, eigenvectors = np.linalg.eig(transition_matrix.T)
+        
+        # 정상 분포 계산
+        stationary_dist = np.real(eigenvectors[:, 0])
+        stationary_dist = stationary_dist / stationary_dist.sum()
+        
+        # 높은 확률 전이 추출
+        high_probability_transitions = []
         threshold = np.mean(transition_matrix) + np.std(transition_matrix)
         for i in range(45):
             for j in range(45):
                 if transition_matrix[i, j] > threshold:
-                    high_prob_transitions.append((i + 1, j + 1))
-
-        return {
+                    high_probability_transitions.append((i+1, j+1, transition_matrix[i, j]))
+        
+        result = {
             'transition_matrix': transition_matrix.tolist(),
-            'high_probability_transitions': high_prob_transitions
+            'high_probability_transitions': high_probability_transitions,
+            'eigenvalues': eigenvalues.tolist(),
+            'eigenvectors': eigenvectors.tolist(),
+            'stationary_distribution': stationary_dist.tolist()
         }
+        
+        self._cache_result(cache_key, result)
+        return result
 
+    @safe_execute
+    @log_performance
     def _analyze_fourier(self) -> Dict[str, Any]:
-        """푸리에 변환 기반 주기성 분석"""
-        # 캐시 확인
-        cache_key = 'fourier_analysis'
+        """푸리에 변환 분석"""
+        cache_key = 'fourier'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # 시계열 데이터 준비
-        time_series = numbers_array.flatten()
-
-        # 푸리에 변환
-        fft_result = fft(time_series)
-        frequencies = np.fft.fftfreq(len(time_series))
-
-        # 주요 주기 찾기 (오버플로우 방지를 위한 수정)
-        magnitudes = np.abs(fft_result)  # 복소수의 절대값 계산 (제곱 연산 사용하지 않음)
-
-        # 중요도 임계값 계산 (float64 타입 유지)
-        threshold = np.mean(magnitudes) + np.std(magnitudes)
-        significant_freqs = frequencies[magnitudes > threshold]
-
-        # 주기성 있는 번호 찾기 (오버플로우 방지 수정)
+            
+        # 모든 번호를 1차원 배열로 변환
+        numbers = np.array([num for nums in self.data['numbers'] for num in nums])
+        
+        # 푸리에 변환 수행
+        fft_result = np.fft.fft(numbers)
+        frequencies = np.fft.fftfreq(len(numbers))
+        
+        # 진폭 계산
+        amplitudes = np.abs(fft_result)
+        
+        # 주요 주파수 성분 추출
+        significant_freq_mask = amplitudes > np.mean(amplitudes) + np.std(amplitudes)
+        significant_frequencies = frequencies[significant_freq_mask]
+        
+        # 주기성 있는 번호 추출
         periodic_numbers = []
-        for i in range(1, 46):
-            if i in time_series:
-                idx = np.where(time_series == i)[0]
-                if len(idx) > 1:
-                    periods = np.diff(idx).astype(np.float64)  # float64로 변환
-                    if np.std(periods) < np.mean(periods):
-                        periodic_numbers.append(str(i))
-
+        for freq in significant_frequencies:
+            if freq > 0:  # 양의 주파수만 고려
+                period = int(1/freq)
+                if 1 <= period <= 45:  # 유효한 번호 범위
+                    periodic_numbers.append(period)
+        
         result = {
             'frequencies': frequencies.tolist(),
-            'magnitudes': magnitudes.tolist(),
-            'significant_frequencies': significant_freqs.tolist(),
+            'amplitudes': amplitudes.tolist(),
+            'significant_frequencies': significant_frequencies.tolist(),
             'periodic_numbers': periodic_numbers
         }
-
-        # 결과 캐싱
+        
         self._cache_result(cache_key, result)
         return result
 
+    @safe_execute
+    @log_performance
     def _analyze_duplicate_patterns(self) -> Dict[str, Any]:
-        """
-        중복 패턴 분석
-        - 과거 당첨 번호 중 중복된 조합이 있는지 확인
-        - 중복된 번호들의 출현 빈도 분석
-        - 중복된 번호들의 간격 분석
-        """
-        # 캐시 확인
-        cache_key = 'duplicate_patterns'
+        """중복 패턴 분석"""
+        cache_key = 'duplicate'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환
-        numbers_array = np.array(self.data['numbers'].tolist())
-
-        # 중복 패턴 찾기
+            
         duplicate_patterns = {}
-        for i in range(len(numbers_array)):
-            current_numbers = tuple(sorted(numbers_array[i]))
-            if current_numbers in duplicate_patterns:
-                duplicate_patterns[current_numbers].append(i)
+        pattern_details = {}
+        
+        for i, numbers in enumerate(self.data['numbers']):
+            pattern = tuple(sorted(numbers))
+            if pattern in duplicate_patterns:
+                duplicate_patterns[pattern] += 1
+                pattern_details[pattern]['occurrence_count'] += 1
+                pattern_details[pattern]['gaps'].append(i - pattern_details[pattern]['last_occurrence'])
+                pattern_details[pattern]['last_occurrence'] = i
             else:
-                duplicate_patterns[current_numbers] = [i]
-
-        # 중복된 패턴만 필터링
-        duplicate_patterns = {k: v for k, v in duplicate_patterns.items() if len(v) > 1}
-
-        # 중복 패턴 분석
-        analysis_results = {
-            'total_patterns': len(numbers_array),
-            'unique_patterns': len(set(tuple(sorted(row)) for row in numbers_array)),
-            'duplicate_patterns': len(duplicate_patterns),
-            'pattern_details': []
-        }
-
-        # 각 중복 패턴의 상세 정보 분석
-        for pattern, indices in duplicate_patterns.items():
-            pattern_info = {
-                'numbers': list(pattern),
-                'occurrence_count': len(indices),
-                'occurrence_indices': indices,
-                'gaps': []
-            }
-
-            # 간격 계산
-            for i in range(len(indices) - 1):
-                gap = indices[i + 1] - indices[i]
-                pattern_info['gaps'].append(gap)
-
-            pattern_info['average_gap'] = np.mean(pattern_info['gaps']) if pattern_info['gaps'] else 0
-            pattern_info['min_gap'] = min(pattern_info['gaps']) if pattern_info['gaps'] else 0
-            pattern_info['max_gap'] = max(pattern_info['gaps']) if pattern_info['gaps'] else 0
-
-            analysis_results['pattern_details'].append(pattern_info)
-
-        # 통계 정보 추가
-        analysis_results['statistics'] = {
-            'duplicate_rate': len(duplicate_patterns) / len(numbers_array),
-            'most_duplicated_count': max(len(v) for v in duplicate_patterns.values()) if duplicate_patterns else 0,
-            'average_duplication_gap': np.mean([np.mean(info['gaps']) for info in analysis_results['pattern_details']]) if analysis_results['pattern_details'] else 0
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, analysis_results)
-        return analysis_results
-
-    def _analyze_number_patterns(self) -> Dict[str, Any]:
-        """
-        번호별 출현 패턴 분석
-        - 각 번호의 출현 빈도
-        - 연속 출현 패턴
-        - 미출현 기간 패턴
-        - 출현 간격 패턴
-        """
-        # 캐시 확인
-        cache_key = 'number_patterns'
-        cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
-            return cached_result
-
-        # 리스트 형태의 numbers를 numpy 배열로 변환
-        numbers_array = np.array(self.data['numbers'].tolist())
-
-        # 각 번호별 패턴 분석
-        number_patterns = {}
-        for number in range(1, 46):
-            # 해당 번호의 출현 위치 찾기
-            appearances = np.where(numbers_array == number)[0]
-
-            # 출현 간격 계산
-            gaps = np.diff(appearances) if len(appearances) > 1 else []
-
-            # 연속 출현 패턴 찾기
-            consecutive_appearances = []
-            current_streak = 1
-            for i in range(len(appearances) - 1):
-                if appearances[i + 1] - appearances[i] == 1:
-                    current_streak += 1
-                else:
-                    if current_streak > 1:
-                        consecutive_appearances.append(current_streak)
-                    current_streak = 1
-            if current_streak > 1:
-                consecutive_appearances.append(current_streak)
-
-            # 미출현 기간 찾기
-            non_appearance_periods = []
-            for i in range(len(appearances) - 1):
-                period = appearances[i + 1] - appearances[i] - 1
-                if period > 0:
-                    non_appearance_periods.append(period)
-
-            # 패턴 정보 저장
-            number_patterns[number] = {
-                'total_appearances': len(appearances),
-                'appearance_rate': len(appearances) / len(numbers_array),
-                'appearance_indices': appearances.tolist(),
-                'gaps': gaps.tolist(),
-                'consecutive_appearances': consecutive_appearances,
-                'non_appearance_periods': non_appearance_periods,
-                'statistics': {
-                    'average_gap': np.mean(gaps) if len(gaps) > 0 else 0,
-                    'max_gap': np.max(gaps) if len(gaps) > 0 else 0,
-                    'min_gap': np.min(gaps) if len(gaps) > 0 else 0,
-                    'max_consecutive': max(consecutive_appearances) if consecutive_appearances else 0,
-                    'average_non_appearance': np.mean(non_appearance_periods) if non_appearance_periods else 0,
-                    'max_non_appearance': max(non_appearance_periods) if non_appearance_periods else 0
+                duplicate_patterns[pattern] = 1
+                pattern_details[pattern] = {
+                    'occurrence_count': 1,
+                    'gaps': [],
+                    'last_occurrence': i
                 }
+        
+        # 통계 계산
+        total_patterns = len(duplicate_patterns)
+        duplicate_count = sum(1 for count in duplicate_patterns.values() if count > 1)
+        most_duplicated = max(duplicate_patterns.values()) if duplicate_patterns else 0
+        
+        # 평균 중복 간격 계산
+        all_gaps = [gap for details in pattern_details.values() for gap in details['gaps']]
+        avg_gap = np.mean(all_gaps) if all_gaps else 0
+        
+        statistics = {
+            'duplicate_rate': duplicate_count / total_patterns if total_patterns > 0 else 0,
+            'most_duplicated_count': most_duplicated,
+            'average_duplication_gap': avg_gap
+        }
+        
+        self.duplicate_stats = {
+            'duplicate_patterns': duplicate_patterns,
+            'pattern_details': pattern_details,
+            'statistics': statistics
+        }
+        
+        self._cache_result(cache_key, self.duplicate_stats)
+        return self.duplicate_stats
+
+    @safe_execute
+    @log_performance
+    def _analyze_number_patterns(self) -> Dict[str, Any]:
+        """번호별 패턴 분석"""
+        cache_key = 'number'
+        cached_result = self._get_cached_result(cache_key)
+        if cached_result:
+            return cached_result
+        
+        pattern_counts = {'high': 0, 'low': 0}
+        number_patterns = {}
+        
+        # 1-45 번호에 대한 패턴 분석
+        for num in range(1, 46):
+            appearances = []
+            gaps = []
+            consecutive = 0
+            non_appearance = 0
+            last_appearance = -1
+            
+            for i, numbers in enumerate(self.data['numbers']):
+                if num in numbers:
+                    if last_appearance == -1:
+                        consecutive = 1
+                    elif i - last_appearance == 1:
+                        consecutive += 1
+                    else:
+                        consecutive = 1
+                    appearances.append(i)
+                    if last_appearance != -1:
+                        gaps.append(i - last_appearance)
+                    last_appearance = i
+                else:
+                    non_appearance += 1
+                    
+            number_patterns[num] = {
+                'appearances': appearances,
+                'gaps': gaps,
+                'consecutive': consecutive,
+                'non_appearance': non_appearance,
+                'last_appearance': last_appearance
             }
-
-        # 전체 통계 계산
-        overall_stats = {
-            'total_numbers': len(number_patterns),
-            'average_appearances': np.mean([info['total_appearances'] for info in number_patterns.values()]),
-            'std_appearances': np.std([info['total_appearances'] for info in number_patterns.values()]),
-            'average_non_appearance': np.mean([info['statistics']['average_non_appearance'] for info in number_patterns.values()]),
-            'max_non_appearance': max(info['statistics']['max_non_appearance'] for info in number_patterns.values())
-        }
-
+            
+        # 고/저 패턴 분석
+        for numbers in self.data['numbers']:
+            high_count = sum(1 for n in numbers if n > 23)
+            low_count = 6 - high_count
+            pattern_counts['high'] += high_count
+            pattern_counts['low'] += low_count
+            
         result = {
-            'number_patterns': number_patterns,
-            'overall_stats': overall_stats
+            'pattern_counts': pattern_counts,
+            'number_patterns': number_patterns
         }
-
-        # 결과 캐싱
+        
         self._cache_result(cache_key, result)
         return result
 
+    @safe_execute
+    @log_performance
     def _analyze_combination_stats(self) -> Dict[str, Any]:
-        """
-        번호 조합 통계 분석
-        - 당첨 번호 조합의 통계적 속성 분석
-        - 분포 및 시간에 따른 변화 패턴 분석
-        """
-        # 캐시 확인
-        cache_key = 'combination_stats'
+        """조합 통계 분석"""
+        cache_key = 'combination'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
+            
+        combination_counts = {}
+        for numbers in self.data['numbers']:
+            for i in range(len(numbers)-1):
+                for j in range(i+1, len(numbers)):
+                    combo = tuple(sorted([numbers[i], numbers[j]]))
+                    combination_counts[combo] = combination_counts.get(combo, 0) + 1
+                    
+        self.combination_stats['combination_counts'] = combination_counts
+        self._cache_result(cache_key, self.combination_stats)
+        return self.combination_stats
 
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 기본 통계량 계산
-        stats_dict = {
-            'variance': torch.var(numbers_tensor).item(),
-            'std_dev': torch.std(numbers_tensor).item(),
-            'range': (torch.max(numbers_tensor) - torch.min(numbers_tensor)).item(),
-            'median': torch.median(numbers_tensor).item(),
-            'skewness': torch.mean(((numbers_tensor - torch.mean(numbers_tensor)) / torch.std(numbers_tensor)) ** 3).item(),
-            'kurtosis': torch.mean(((numbers_tensor - torch.mean(numbers_tensor)) / torch.std(numbers_tensor)) ** 4).item() - 3
-        }
-
-        # 시간에 따른 변화 패턴 분석
-        window_size = 10
-        n_windows = len(numbers_array) // window_size
-        time_series_stats = {
-            'variance': [],
-            'std_dev': [],
-            'range': [],
-            'median': [],
-            'skewness': [],
-            'kurtosis': []
-        }
-
-        for i in range(n_windows):
-            start_idx = i * window_size
-            end_idx = start_idx + window_size
-            window_data = numbers_tensor[start_idx:end_idx]
-
-            time_series_stats['variance'].append(torch.var(window_data).item())
-            time_series_stats['std_dev'].append(torch.std(window_data).item())
-            time_series_stats['range'].append((torch.max(window_data) - torch.min(window_data)).item())
-            time_series_stats['median'].append(torch.median(window_data).item())
-            time_series_stats['skewness'].append(
-                torch.mean(((window_data - torch.mean(window_data)) / torch.std(window_data)) ** 3).item()
-            )
-            time_series_stats['kurtosis'].append(
-                torch.mean(((window_data - torch.mean(window_data)) / torch.std(window_data)) ** 4).item() - 3
-            )
-
-        result = {
-            'basic_stats': stats_dict,
-            'time_series_stats': time_series_stats
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
     def _analyze_moving_averages(self) -> Dict[str, Any]:
-        """
-        이동 평균 기반 트렌드 분석
-        - 다양한 기간의 이동 평균 계산
-        - 골든/데드 크로스 분석
-        - 트렌드 강도와 방향성 측정
-        """
-        # 캐시 확인
-        cache_key = 'moving_averages'
+        """이동 평균 분석"""
+        cache_key = 'moving'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
+            
+        sums = [sum(numbers) for numbers in self.data['numbers']]
+        self.moving_stats['ma5'] = pd.Series(sums).rolling(5).mean().tolist()
+        self.moving_stats['ma10'] = pd.Series(sums).rolling(10).mean().tolist()
+        self.moving_stats['ma20'] = pd.Series(sums).rolling(20).mean().tolist()
+        
+        self._cache_result(cache_key, self.moving_stats)
+        return self.moving_stats
 
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
-
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 이동 평균 기간 설정
-        periods = [5, 10, 20]
-        moving_avg_results = {}
-
-        for period in periods:
-            # 각 번호별 이동 평균 계산
-            ma = torch.zeros_like(numbers_tensor)
-            for i in range(period - 1, len(numbers_tensor)):
-                ma[i] = torch.mean(numbers_tensor[i-period+1:i+1], dim=0)
-
-            # 골든/데드 크로스 분석
-            cross_points = []
-            for i in range(period, len(numbers_tensor)):
-                prev_diff = ma[i-1].cpu().numpy() - ma[i-2].cpu().numpy()
-                curr_diff = ma[i].cpu().numpy() - ma[i-1].cpu().numpy()
-                cross_points.append(np.sum((prev_diff * curr_diff) < 0))
-
-            # 트렌드 강도 계산
-            trend_strength = torch.abs(ma[period:] - ma[period-1:-1]).mean(dim=0)
-
-            moving_avg_results[f'ma_{period}'] = {
-                'moving_averages': ma.cpu().numpy().tolist(),
-                'cross_points': cross_points,
-                'trend_strength': trend_strength.cpu().numpy().tolist()
-            }
-
-        # 트렌드 방향성 분석
-        trend_direction = {}
-        for period in periods:
-            ma_data = np.array(moving_avg_results[f'ma_{period}']['moving_averages'])
-            direction = np.zeros(len(ma_data))
-            for i in range(1, len(ma_data)):
-                direction[i] = np.mean(ma_data[i] - ma_data[i-1])
-            trend_direction[f'ma_{period}'] = direction.tolist()
-
-        result = {
-            'moving_averages': moving_avg_results,
-            'trend_direction': trend_direction
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
+    @safe_execute
     def _analyze_robust_stats(self) -> Dict[str, Any]:
-        """
-        로버스트 통계 분석
-        - 중앙값, 사분위수, MAD 등 로버스트 통계 기법 활용
-        - 극단값에 덜 민감한 패턴 분석
-        """
-        # 캐시 확인
-        cache_key = 'robust_stats'
+        """강건 통계 분석"""
+        cache_key = 'robust'
         cached_result = self._get_cached_result(cache_key)
-        if cached_result is not None:
+        if cached_result:
             return cached_result
+            
+        sums = [sum(numbers) for numbers in self.data['numbers']]
+        self.robust_stats['median'] = np.median(sums)
+        self.robust_stats['mad'] = np.median(np.abs(sums - self.robust_stats['median']))
+        self.robust_stats['iqr'] = np.percentile(sums, 75) - np.percentile(sums, 25)
+        
+        self._cache_result(cache_key, self.robust_stats)
+        return self.robust_stats
 
-        # 리스트 형태의 numbers를 numpy 배열로 변환 (float64 타입 사용)
-        numbers_array = np.array(self.data['numbers'].tolist(), dtype=np.float64)
+    def _plot_all_patterns(self, plot_dir: Union[str, Path]):
+        """
+        모든 패턴 시각화
 
-        # GPU 가속을 위한 텐서 변환
-        numbers_tensor = torch.from_numpy(numbers_array).to(self.device)
-
-        # 기본 로버스트 통계량 계산
-        median = torch.median(numbers_tensor)
-        robust_stats = {
-            'median': median.item(),
-            'q1': torch.quantile(numbers_tensor, 0.25).item(),
-            'q3': torch.quantile(numbers_tensor, 0.75).item(),
-            'iqr': torch.quantile(numbers_tensor, 0.75).item() - torch.quantile(numbers_tensor, 0.25).item(),
-            'mad': torch.median(torch.abs(numbers_tensor - median)).item()
-        }
-
-        # 윈저화 적용 (상위/하위 5% 제한)
-        lower_bound = torch.quantile(numbers_tensor, 0.05)
-        upper_bound = torch.quantile(numbers_tensor, 0.95)
-        winsorized_data = torch.clamp(numbers_tensor, lower_bound, upper_bound)
-
-        # 윈저화된 데이터의 통계량
-        winsorized_stats = {
-            'mean': torch.mean(winsorized_data).item(),
-            'std': torch.std(winsorized_data).item(),
-            'median': torch.median(winsorized_data).item(),
-            'q1': torch.quantile(winsorized_data, 0.25).item(),
-            'q3': torch.quantile(winsorized_data, 0.75).item()
-        }
-
-        # 극단값 제거 후의 패턴 분석
-        z_scores = torch.abs((numbers_tensor - torch.mean(numbers_tensor)) / torch.std(numbers_tensor))
-        outlier_mask = z_scores > 2
-        clean_data = numbers_tensor[~outlier_mask]
-
-        clean_stats = {
-            'mean': torch.mean(clean_data).item(),
-            'std': torch.std(clean_data).item(),
-            'median': torch.median(clean_data).item(),
-            'q1': torch.quantile(clean_data, 0.25).item(),
-            'q3': torch.quantile(clean_data, 0.75).item()
-        }
-
-        result = {
-            'robust_stats': robust_stats,
-            'winsorized_stats': winsorized_stats,
-            'clean_stats': clean_stats,
-            'outlier_count': torch.sum(outlier_mask).item()
-        }
-
-        # 결과 캐싱
-        self._cache_result(cache_key, result)
-        return result
-
-    def _plot_all_patterns(self, plot_dir: str):
-        """모든 패턴 시각화"""
+        Args:
+            plot_dir: 그래프 저장 디렉토리 경로
+        """
         # 기본 저장 경로 설정
         base_dir = Path('lottery/data/results/graph')
+        plot_dir = Path(plot_dir)
         plot_dir = base_dir / plot_dir
         plot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -975,9 +844,9 @@ class PatternAnalyzer:
 
         plt.figure(figsize=(12, 6))
         frequencies = self.fourier_stats['frequencies']
-        magnitudes = self.fourier_stats['magnitudes']
+        amplitudes = self.fourier_stats['amplitudes']
 
-        plt.plot(frequencies, magnitudes)
+        plt.plot(frequencies, amplitudes)
         plt.title('주기성 분석')
         plt.xlabel('주파수')
         plt.ylabel('진폭')
@@ -1072,7 +941,7 @@ class PatternAnalyzer:
 
         # 기본 통계량 그래프
         plt.subplot(2, 2, 1)
-        stats = self.combination_stats['basic_stats']
+        stats = self.combination_stats['combination_counts']
         plt.bar(stats.keys(), stats.values())
         plt.title('기본 통계량')
         plt.xticks(rotation=45)
@@ -1217,7 +1086,11 @@ class PatternAnalyzer:
 
     def __del__(self):
         """리소스 정리"""
-        self.executor.shutdown(wait=True)
+        try:
+            if hasattr(self, 'executor'):
+                self.executor.shutdown(wait=True)
+        except Exception as e:
+            logger.error(f"리소스 정리 중 오류 발생: {str(e)}")
 
 
 # 모듈 테스트

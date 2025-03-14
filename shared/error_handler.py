@@ -132,39 +132,45 @@ def log_performance(func):
     return wrapper 
 
 # 로깅 설정
-def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """
-    로거 설정
+def setup_logger(name: str) -> logging.Logger:
+    """로거 설정
     
-    특징:
-    1. 파일 및 콘솔 로깅
-    2. 로그 포맷팅
-    3. 로그 로테이션
-    4. 성능 메트릭
+    Args:
+        name: 로거 이름
+        
+    Returns:
+        설정된 로거
     """
+    # 로그 디렉토리 생성
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # 로거 생성
     logger = logging.getLogger(name)
-    logger.setLevel(level)
+    logger.setLevel(logging.INFO)  # 로거의 기본 레벨은 INFO
     
     # 이미 핸들러가 있다면 추가하지 않음
     if logger.handlers:
         return logger
     
-    # 로그 포맷 설정
+    # 포맷터 설정
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # 콘솔 핸들러
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    
-    # 파일 핸들러
+    # 파일 핸들러 설정 (ERROR 이상만 기록)
     file_handler = logging.FileHandler(
-        f'logs/{name}_{datetime.datetime.now().strftime("%Y%m%d")}.log'
+        log_dir / f"{name}_{datetime.datetime.now().strftime('%Y%m%d')}.log"
     )
+    file_handler.setLevel(logging.ERROR)  # ERROR 레벨 이상만 파일에 기록
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
+    
+    # 콘솔 핸들러 설정 (INFO 이상 표시)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)  # INFO 레벨 이상을 콘솔에 표시
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
     
     return logger
 

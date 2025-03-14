@@ -52,6 +52,22 @@ class TrainingConfig:
     pin_memory: bool
 
 @dataclass
+class CudaConfig:
+    """CUDA 설정"""
+    use_gpu: bool
+    memory_fraction: float = 0.95
+    allow_tf32: bool = True
+    benchmark: bool = True
+    deterministic: bool = False
+    cudnn_enabled: bool = True
+    compile_mode: bool = True
+    device: str = 'cuda'
+    gradient_accumulation_steps: int = 4
+    num_workers: int = 8
+    pin_memory: bool = True
+    precision: str = 'float16'
+
+@dataclass
 class Config:
     """설정 관리 클래스"""
 
@@ -63,6 +79,12 @@ class Config:
             config_dict: 설정 딕셔너리
         """
         self._config = config_dict or {}
+
+        # CUDA 설정 초기화
+        if 'cuda' in self._config:
+            self.cuda = CudaConfig(**self._config['cuda'])
+        else:
+            self.cuda = CudaConfig(use_gpu=True)
 
         # 데이터 설정 초기화
         if 'data' in self._config:
@@ -192,6 +214,7 @@ class Config:
             설정 딕셔너리
         """
         return {
+            'cuda': self.cuda.__dict__,
             'data': self.data.__dict__,
             'model': self.model.__dict__,
             'training': self.training.__dict__

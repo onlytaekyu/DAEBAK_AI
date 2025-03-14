@@ -1,8 +1,7 @@
 """
-통합 모델 관리 시스템
+모델 통합 및 앙상블 시스템
 
-이 모듈은 다양한 머신러닝/딥러닝 모델을 통합하고 최적화하는 
-범용 앙상블 시스템을 구현합니다.
+이 모듈은 다양한 머신러닝/딥러닝 모델을 통합하고 최적화하는 시스템을 제공합니다.
 """
 
 import os
@@ -25,83 +24,72 @@ import itertools
 import logging
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-
-from shared.error_handler import get_logger, safe_execute, log_performance
-from shared.cuda_optimizers import clear_memory, get_optimal_batch_size
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import optuna
+from .cuda_optimizers import CUDAOptimizer, TensorCache, InferenceBuffer
+from .memory_manager import MemoryManager
+from .error_handler import safe_execute, log_performance, get_logger
+from dataclasses import dataclass
+from queue import PriorityQueue
+import hashlib
+from scipy import stats
 
 logger = get_logger(__name__)
 
+@dataclass
+class ModelConfig:
+    """모델 설정 데이터 클래스"""
+    name: str
+    type: str
+    params: Dict[str, Any]
+    device: str
+    batch_size: int
+    precision: str
+    use_amp: bool
+    num_workers: int
+    pin_memory: bool
+
+@dataclass
+class EnsembleConfig:
+    """앙상블 설정 데이터 클래스"""
+    method: str
+    weights: Optional[List[float]]
+    n_splits: int
+    random_state: int
+    n_trials: int
+    timeout: int
+
 class ModelIntegrator:
-    """
-    범용 모델 통합 및 앙상블 관리 시스템
+    """모델 통합 시스템"""
     
-    특징:
-    1. 다양한 모델 타입 지원 (PyTorch, LightGBM, 등)
-    2. 동적 앙상블 가중치 최적화
-    3. GPU 가속 및 메모리 최적화
-    4. 자동 성능 모니터링
-    5. 다양한 최적화 전략 지원
-    """
-    
-    def __init__(self, config: Dict[str, Any] = None):
+    def __init__(self, config: Dict[str, Any]):
         """
-        통합 모듈 초기화
+        모델 통합 시스템 초기화
         
         Args:
-            config: 설정 딕셔너리
+            config: 설정 정보
         """
-        self.config = config or {}
-        self.models = {}
-        self.model_weights = {}
-        self.diversity_scores = {}
-        self.weight_history = []
-        
-        # 성능 메트릭
-        self.performance_metrics = {
-            'inference_time': [],
-            'memory_usage': [],
-            'accuracy': [],
-            'confidence': [],
-            'roi': [],
-            'sharpe_ratio': []
-        }
-        
-        # 학습 파라미터
-        self.weight_update_alpha = self.config.get('weight_update_alpha', 0.1)
-        self.diversity_threshold = self.config.get('diversity_threshold', 0.3)
-        self.uncertainty_weight = self.config.get('uncertainty_weight', 0.2)
-        
-        # GPU 설정
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if self.device.type == "cuda":
-            self._setup_cuda()
-        
-        # 메모리 캐시 관리
-        self.memory_cache = {}
-        self.max_cache_size = config.get('max_cache_size', 1000)
-        
-        # 최적화 설정
-        self.dynamic_weights = self.config.get('dynamic_weights', True)
-        self.min_diversity_score = self.config.get('min_diversity_score', 0.3)
-        
-        # 로깅 설정
+        self.config = config
+        self.models: Dict[str, Any] = {}
+        self.weights: List[float] = []
+        self.ensemble_config = EnsembleConfig(**config.get('ensemble', {}))
+        self.cuda_optimizer = CUDAOptimizer(config.get('cuda', {}))
+        self.memory_manager = MemoryManager()
         self._setup_logging()
-    
-    def _setup_cuda(self):
-        """CUDA 최적화 설정"""
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.cuda.empty_cache()
         
-        # CUDA 메모리 관리
-        torch.cuda.set_per_process_memory_fraction(0.9)
-        torch.cuda.memory.set_per_process_memory_fraction(0.9)
+        # 스레드 안전성을 위한 락
+        self.model_lock = threading.Lock()
+        self.weight_lock = threading.Lock()
         
-        # CUDA 스트림 설정
-        self.stream = torch.cuda.Stream()
-        torch.cuda.set_stream(self.stream)
+        # 성능 모니터링
+        self.performance_metrics = {
+            'inference_times': [],
+            'memory_usage': [],
+            'errors': []
+        }
     
     def _setup_logging(self):
         """로깅 설정"""
@@ -118,337 +106,310 @@ class ModelIntegrator:
         )
         self.logger = logging.getLogger(__name__)
     
-    def add_model(self, name: str, model: Any, model_type: str, weight: float = 1.0):
+    @safe_execute
+    def add_model(self, model: Any, config: ModelConfig):
         """
         모델 추가
         
         Args:
-            name: 모델 이름
-            model: 모델 인스턴스
-            model_type: 모델 유형 ('pytorch', 'lightgbm', 등)
-            weight: 초기 가중치
+            model: 모델 객체
+            config: 모델 설정
         """
-        if name in self.models:
-            self.logger.warning(f"모델 {name}이(가) 이미 존재합니다. 덮어쓰기를 수행합니다.")
+        with self.model_lock:
+            if config.name in self.models:
+                raise ValueError(f"모델 '{config.name}'이(가) 이미 존재합니다.")
+            
+            # CUDA 최적화 적용
+            if config.device == 'cuda':
+                model = self.cuda_optimizer.optimize_model(model)
+            
+            self.models[config.name] = {
+                'model': model,
+                'config': config
+            }
+            
+            # 가중치 초기화
+            with self.weight_lock:
+                self.weights = [1.0 / len(self.models)] * len(self.models)
+            
+            self.logger.info(f"모델 '{config.name}' 추가 완료")
+    
+    @safe_execute
+    def remove_model(self, model_name: str):
+        """
+        모델 제거
         
-        self.models[name] = {
-            'model': model,
-            'type': model_type
-        }
-        self.model_weights[name] = weight
-        self._normalize_weights()
+        Args:
+            model_name: 모델 이름
+        """
+        with self.model_lock:
+            if model_name not in self.models:
+                raise ValueError(f"모델 '{model_name}'이(가) 존재하지 않습니다.")
+            
+            del self.models[model_name]
+            
+            # 가중치 재조정
+            with self.weight_lock:
+                if self.models:
+                    self.weights = [1.0 / len(self.models)] * len(self.models)
+                else:
+                    self.weights = []
+            
+            self.logger.info(f"모델 '{model_name}' 제거 완료")
     
-    def _normalize_weights(self):
-        """가중치 정규화"""
-        total = sum(self.model_weights.values())
-        if total > 0:
-            self.model_weights = {k: v/total for k, v in self.model_weights.items()}
-    
-    @safe_execute(default_return=None)
-    def optimize_weights(self, validation_data: np.ndarray, 
-                        validation_labels: np.ndarray,
-                        method: str = 'bayesian') -> Dict[str, float]:
+    @safe_execute
+    @log_performance
+    def optimize_weights(self, X: np.ndarray, y: np.ndarray, method: str = None):
         """
         앙상블 가중치 최적화
         
         Args:
-            validation_data: 검증 데이터
-            validation_labels: 검증 레이블
-            method: 최적화 방법 ('bayesian', 'grid', 'random')
-            
-        Returns:
-            최적화된 가중치 딕셔너리
+            X: 입력 데이터
+            y: 타겟 데이터
+            method: 최적화 방법 (기본값: 설정된 방법)
         """
-        if method == 'bayesian':
-            return self._optimize_weights_bayesian(validation_data, validation_labels)
-        elif method == 'grid':
-            return self._optimize_weights_grid(validation_data, validation_labels)
-        else:
-            return self._optimize_weights_random(validation_data, validation_labels)
+        if not self.models:
+            raise ValueError("최적화할 모델이 없습니다.")
+        
+        method = method or self.ensemble_config.method
+        
+        with self.weight_lock:
+            if method == 'bayesian':
+                self._optimize_weights_bayesian(X, y)
+            elif method == 'grid':
+                self._optimize_weights_grid(X, y)
+            elif method == 'random':
+                self._optimize_weights_random(X, y)
+            else:
+                raise ValueError(f"지원하지 않는 최적화 방법입니다: {method}")
     
-    def _optimize_weights_bayesian(self, validation_data: np.ndarray,
-                                 validation_labels: np.ndarray) -> Dict[str, float]:
-        """베이지안 최적화"""
-        def objective(weights):
-            predictions = self._ensemble_predict(validation_data, weights)
-            return -np.mean(predictions == validation_labels)
+    def _optimize_weights_bayesian(self, X: np.ndarray, y: np.ndarray):
+        """베이지안 최적화로 가중치 최적화"""
+        def objective(trial):
+            weights = []
+            for _ in range(len(self.models)):
+                weights.append(trial.suggest_float(f'weight_{_}', 0, 1))
+            weights = np.array(weights) / np.sum(weights)
+            
+            predictions = self._get_predictions(X, weights)
+            mse = mean_squared_error(y, predictions)
+            return mse
         
-        # 초기 가중치 설정
-        initial_weights = np.array(list(self.model_weights.values()))
-        
-        # 베이지안 최적화
-        optimizer = BayesianOptimization(
-            f=objective,
-            pbounds={f'w{i}': (0, 1) for i in range(len(self.model_weights))},
-            random_state=42
+        study = optuna.create_study(direction='minimize')
+        study.optimize(
+            objective,
+            n_trials=self.ensemble_config.n_trials,
+            timeout=self.ensemble_config.timeout
         )
         
-        optimizer.maximize(
-            init_points=5,
-            n_iter=20
-        )
-        
-        # 최적 가중치 적용
-        optimal_weights = optimizer.max['params']
-        return {name: optimal_weights[f'w{i}'] 
-                for i, name in enumerate(self.model_weights.keys())}
+        best_weights = []
+        for i in range(len(self.models)):
+            best_weights.append(study.best_params[f'weight_{i}'])
+        self.weights = np.array(best_weights) / np.sum(best_weights)
     
-    def _optimize_weights_grid(self, validation_data: np.ndarray,
-                             validation_labels: np.ndarray) -> Dict[str, float]:
-        """그리드 서치 최적화"""
-        best_score = -float('inf')
-        best_weights = self.model_weights.copy()
+    def _optimize_weights_grid(self, X: np.ndarray, y: np.ndarray):
+        """그리드 서치로 가중치 최적화"""
+        n_splits = self.ensemble_config.n_splits
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.ensemble_config.random_state)
+        
+        best_weights = None
+        best_score = float('inf')
         
         # 그리드 포인트 생성
         grid_points = np.linspace(0, 1, 10)
-        
-        for weights in itertools.product(grid_points, repeat=len(self.model_weights)):
-            if sum(weights) == 0:
-                continue
+        for weights in self._generate_weight_combinations(grid_points, len(self.models)):
+            scores = []
+            for train_idx, val_idx in kf.split(X):
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y[train_idx], y[val_idx]
                 
-            # 가중치 정규화
-            normalized_weights = {name: w/sum(weights) 
-                                for name, w in zip(self.model_weights.keys(), weights)}
+                # 각 모델 학습
+                for model_info in self.models.values():
+                    model = model_info['model']
+                    if hasattr(model, 'fit'):
+                        model.fit(X_train, y_train)
+                
+                # 검증 세트로 예측
+                predictions = self._get_predictions(X_val, weights)
+                score = mean_squared_error(y_val, predictions)
+                scores.append(score)
             
-            # 성능 평가
-            predictions = self._ensemble_predict(validation_data, normalized_weights)
-            score = np.mean(predictions == validation_labels)
-            
-            if score > best_score:
-                best_score = score
-                best_weights = normalized_weights
+            mean_score = np.mean(scores)
+            if mean_score < best_score:
+                best_score = mean_score
+                best_weights = weights
         
-        return best_weights
+        self.weights = best_weights
     
-    def _optimize_weights_random(self, validation_data: np.ndarray,
-                               validation_labels: np.ndarray) -> Dict[str, float]:
-        """랜덤 서치 최적화"""
-        best_score = -float('inf')
-        best_weights = self.model_weights.copy()
+    def _optimize_weights_random(self, X: np.ndarray, y: np.ndarray):
+        """랜덤 서치로 가중치 최적화"""
+        n_splits = self.ensemble_config.n_splits
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.ensemble_config.random_state)
         
-        for _ in range(100):
-            # 랜덤 가중치 생성
-            weights = np.random.random(len(self.model_weights))
-            weights = weights / weights.sum()
-            
-            normalized_weights = {name: w 
-                                for name, w in zip(self.model_weights.keys(), weights)}
-            
-            # 성능 평가
-            predictions = self._ensemble_predict(validation_data, normalized_weights)
-            score = np.mean(predictions == validation_labels)
-            
-            if score > best_score:
-                best_score = score
-                best_weights = normalized_weights
+        best_weights = None
+        best_score = float('inf')
         
-        return best_weights
+        for _ in range(self.ensemble_config.n_trials):
+            weights = np.random.rand(len(self.models))
+            weights = weights / np.sum(weights)
+            
+            scores = []
+            for train_idx, val_idx in kf.split(X):
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y[train_idx], y[val_idx]
+                
+                # 각 모델 학습
+                for model_info in self.models.values():
+                    model = model_info['model']
+                    if hasattr(model, 'fit'):
+                        model.fit(X_train, y_train)
+                
+                # 검증 세트로 예측
+                predictions = self._get_predictions(X_val, weights)
+                score = mean_squared_error(y_val, predictions)
+                scores.append(score)
+            
+            mean_score = np.mean(scores)
+            if mean_score < best_score:
+                best_score = mean_score
+                best_weights = weights
+        
+        self.weights = best_weights
     
-    @safe_execute(default_return=None)
-    def predict(self, data: np.ndarray) -> Tuple[np.ndarray, float]:
+    def _generate_weight_combinations(self, grid_points: np.ndarray, n_models: int) -> List[np.ndarray]:
+        """가중치 조합 생성"""
+        if n_models == 1:
+            return [np.array([1.0])]
+        
+        combinations = []
+        for weights in self._generate_weights_recursive(grid_points, n_models):
+            if np.isclose(np.sum(weights), 1.0):
+                combinations.append(weights)
+        return combinations
+    
+    def _generate_weights_recursive(self, grid_points: np.ndarray, n_models: int) -> List[np.ndarray]:
+        """재귀적으로 가중치 조합 생성"""
+        if n_models == 1:
+            return [[w] for w in grid_points]
+        
+        combinations = []
+        for w in grid_points:
+            sub_combinations = self._generate_weights_recursive(grid_points, n_models - 1)
+            for sub_combo in sub_combinations:
+                combinations.append([w] + sub_combo)
+        return combinations
+    
+    @safe_execute
+    @log_performance
+    def predict(self, X: np.ndarray) -> np.ndarray:
         """
-        앙상블 예측 및 신뢰도 계산
+        앙상블 예측 수행
         
         Args:
-            data: 입력 데이터
+            X: 입력 데이터
             
         Returns:
-            예측값과 신뢰도 점수
+            예측 결과
         """
-        # 예측 수행
-        predictions = self._ensemble_predict(data)
+        if not self.models:
+            raise ValueError("예측할 모델이 없습니다.")
         
-        # 신뢰도 계산
-        confidence = self._calculate_confidence(predictions)
+        with self.weight_lock:
+            weights = self.weights
         
-        # 성능 메트릭 업데이트
-        self.performance_metrics['confidence'].append(confidence)
-        
-        return predictions, confidence
+        return self._get_predictions(X, weights)
     
-    def _ensemble_predict(self, data: np.ndarray, 
-                         weights: Optional[Dict[str, float]] = None) -> np.ndarray:
-        """앙상블 예측"""
-        if weights is None:
-            weights = self.model_weights
+    def _get_predictions(self, X: np.ndarray, weights: np.ndarray) -> np.ndarray:
+        """
+        가중치를 적용한 예측 수행
         
+        Args:
+            X: 입력 데이터
+            weights: 모델 가중치
+            
+        Returns:
+            가중 평균 예측 결과
+        """
         predictions = []
-        for name, info in self.models.items():
-            try:
-                # 캐시 확인
-                cache_key = f"{name}_{hash(str(data))}"
-                if cache_key in self.memory_cache:
-                    pred = self.memory_cache[cache_key]
-                else:
-                    # 예측 수행
-                    start_time = time.time()
-                    model = info['model']
-                    
-                    if info['type'] == 'pytorch':
-                        with torch.no_grad():
-                            model.eval()
-                            if isinstance(data, np.ndarray):
-                                data_tensor = torch.tensor(data, device=self.device)
-                            pred = model(data_tensor).cpu().numpy()
-                    else:
-                        pred = model.predict(data)
-                    
-                    end_time = time.time()
-                    
-                    # 성능 메트릭 기록
-                    self.performance_metrics['inference_time'].append(end_time - start_time)
-                    if torch.cuda.is_available():
-                        self.performance_metrics['memory_usage'].append(
-                            torch.cuda.memory_allocated() / 1024**2
-                        )
-                    
-                    # 캐시 저장
-                    if len(self.memory_cache) >= self.max_cache_size:
-                        self.memory_cache.pop(next(iter(self.memory_cache)))
-                    self.memory_cache[cache_key] = pred
-                
-                predictions.append(pred * weights[name])
-                
-            except Exception as e:
-                self.logger.error(f"모델 {name} 예측 중 오류 발생: {str(e)}")
-                continue
         
-        if not predictions:
-            raise ValueError("모든 모델 예측 실패")
-        
-        return np.sum(predictions, axis=0)
-    
-    def _calculate_confidence(self, predictions: np.ndarray) -> float:
-        """예측 신뢰도 계산"""
-        try:
-            # 1. 모델 간 일관성
-            model_predictions = []
-            for info in self.models.values():
+        # 병렬 예측 수행
+        with ThreadPoolExecutor() as executor:
+            future_to_model = {
+                executor.submit(self._predict_single_model, model_info['model'], X): model_info
+                for model_info in self.models.values()
+            }
+            
+            for future in future_to_model:
                 try:
-                    model = info['model']
-                    if info['type'] == 'pytorch':
-                        with torch.no_grad():
-                            model.eval()
-                            pred = model(torch.tensor(predictions, device=self.device))
-                            pred = pred.cpu().numpy()
-                    else:
-                        pred = model.predict(predictions)
-                    model_predictions.append(pred)
-                except:
-                    continue
-            
-            if not model_predictions:
-                return 0.5
-            
-            # 모델 간 일치도 계산
-            consistency = np.mean([
-                np.mean(p1 == p2) 
-                for p1, p2 in itertools.combinations(model_predictions, 2)
-            ])
-            
-            # 2. 예측 분산
-            prediction_std = np.std(model_predictions, axis=0).mean()
-            normalized_std = 1 - min(prediction_std / 0.5, 1)
-            
-            # 3. 모델 성능 가중치
-            performance_weights = np.array([
-                np.mean(self.performance_metrics.get(f'{name}_accuracy', [0.5]))
-                for name in self.models.keys()
-            ])
-            performance_weights = performance_weights / performance_weights.sum()
-            
-            # 최종 신뢰도 계산
-            confidence = (
-                0.4 * consistency +
-                0.3 * normalized_std +
-                0.3 * np.mean(performance_weights)
-            )
-            
-            return float(confidence)
-            
-        except Exception as e:
-            self.logger.error(f"신뢰도 계산 중 오류 발생: {str(e)}")
-            return 0.5
+                    pred = future.result()
+                    predictions.append(pred)
+                except Exception as e:
+                    self.logger.error(f"모델 예측 중 오류 발생: {e}")
+                    raise
+        
+        # 가중 평균 계산
+        weighted_pred = np.zeros_like(predictions[0])
+        for pred, weight in zip(predictions, weights):
+            weighted_pred += pred * weight
+        
+        return weighted_pred
     
-    def save_state(self, path: str):
-        """현재 상태 저장"""
-        state = {
-            'config': self.config,
-            'model_weights': self.model_weights,
-            'performance_metrics': self.performance_metrics,
-            'models': {
-                name: {
-                    'type': info['type'],
-                    'state': (
-                        info['model'].state_dict() if info['type'] == 'pytorch'
-                        else info['model'].get_model_state()
-                    )
-                }
-                for name, info in self.models.items()
-            },
-            'timestamp': datetime.now().isoformat()
-        }
+    def _predict_single_model(self, model: Any, X: np.ndarray) -> np.ndarray:
+        """
+        단일 모델 예측
         
-        with open(path, 'wb') as f:
-            pickle.dump(state, f)
-        
-        self.logger.info(f"상태 저장됨: {path}")
-    
-    @classmethod
-    def load_state(cls, path: str) -> 'ModelIntegrator':
-        """저장된 상태 로드"""
-        with open(path, 'rb') as f:
-            state = pickle.load(f)
-        
-        integrator = cls(state['config'])
-        integrator.model_weights = state['model_weights']
-        integrator.performance_metrics = state['performance_metrics']
-        
-        # 모델 상태 복원
-        for name, info in state['models'].items():
-            if name in integrator.models:
-                model = integrator.models[name]['model']
-                if info['type'] == 'pytorch':
-                    model.load_state_dict(info['state'])
-                else:
-                    model.set_model_state(info['state'])
-        
-        return integrator
-    
-    def plot_performance(self, save_path: Optional[str] = None):
-        """성능 지표 시각화"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        fig.suptitle('모델 통합 성능 지표', fontsize=16)
-        
-        # 추론 시간
-        axes[0, 0].plot(self.performance_metrics['inference_time'])
-        axes[0, 0].set_title('추론 시간')
-        axes[0, 0].set_xlabel('반복')
-        axes[0, 0].set_ylabel('시간 (초)')
-        
-        # 메모리 사용량
-        if self.performance_metrics['memory_usage']:
-            axes[0, 1].plot(self.performance_metrics['memory_usage'])
-            axes[0, 1].set_title('GPU 메모리 사용량')
-            axes[0, 1].set_xlabel('반복')
-            axes[0, 1].set_ylabel('메모리 (MB)')
-        
-        # 정확도
-        axes[1, 0].plot(self.performance_metrics['accuracy'])
-        axes[1, 0].set_title('정확도')
-        axes[1, 0].set_xlabel('반복')
-        axes[1, 0].set_ylabel('정확도')
-        
-        # 신뢰도
-        axes[1, 1].plot(self.performance_metrics['confidence'])
-        axes[1, 1].set_title('예측 신뢰도')
-        axes[1, 1].set_xlabel('반복')
-        axes[1, 1].set_ylabel('신뢰도')
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            self.logger.info(f"성능 그래프 저장됨: {save_path}")
+        Args:
+            model: 모델 객체
+            X: 입력 데이터
+            
+        Returns:
+            예측 결과
+        """
+        if hasattr(model, 'predict'):
+            return model.predict(X)
+        elif hasattr(model, 'forward'):
+            # PyTorch 모델
+            model.eval()
+            with torch.no_grad():
+                X_tensor = torch.FloatTensor(X)
+                if next(model.parameters()).is_cuda:
+                    X_tensor = X_tensor.cuda()
+                return model(X_tensor).cpu().numpy()
         else:
-            plt.show()
+            raise ValueError(f"지원하지 않는 모델 타입입니다: {type(model)}")
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """
+        모델 정보 반환
+        
+        Returns:
+            모델 정보 딕셔너리
+        """
+        info = {}
+        for name, model_info in self.models.items():
+            info[name] = {
+                'type': model_info['config'].type,
+                'device': model_info['config'].device,
+                'batch_size': model_info['config'].batch_size,
+                'precision': model_info['config'].precision,
+                'use_amp': model_info['config'].use_amp
+            }
+        return info
+    
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """
+        성능 메트릭 반환
+        
+        Returns:
+            성능 메트릭 딕셔너리
+        """
+        return {
+            'inference_times': self.performance_metrics['inference_times'],
+            'memory_usage': self.performance_metrics['memory_usage'],
+            'errors': self.performance_metrics['errors']
+        }
+    
+    def cleanup(self):
+        """리소스 정리"""
+        self.memory_manager.cleanup()
+        self.cuda_optimizer.cleanup()
