@@ -147,30 +147,25 @@ def setup_logger(name: str) -> logging.Logger:
     
     # 로거 생성
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)  # 로거의 기본 레벨은 INFO
+    logger.setLevel(logging.DEBUG)
     
-    # 이미 핸들러가 있다면 추가하지 않음
-    if logger.handlers:
-        return logger
+    # 콘솔 핸들러 (WARNING 이상만 표시)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)  # INFO에서 WARNING으로 변경
     
-    # 포맷터 설정
+    # 파일 핸들러 (모든 로그 기록)
+    file_handler = logging.FileHandler('lottery/logs/app.log')
+    file_handler.setLevel(logging.DEBUG)
+    
+    # 포맷터
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # 파일 핸들러 설정 (ERROR 이상만 기록)
-    file_handler = logging.FileHandler(
-        log_dir / f"{name}_{datetime.datetime.now().strftime('%Y%m%d')}.log"
-    )
-    file_handler.setLevel(logging.ERROR)  # ERROR 레벨 이상만 파일에 기록
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    
-    # 콘솔 핸들러 설정 (INFO 이상 표시)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)  # INFO 레벨 이상을 콘솔에 표시
     console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
+    
     logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
     
     return logger
 

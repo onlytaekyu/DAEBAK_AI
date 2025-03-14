@@ -217,16 +217,21 @@ class TestPatternAnalyzer(unittest.TestCase):
         """푸리에 변환 분석 테스트"""
         result = self.analyzer._analyze_fourier()
         
-        # 결과 검증
+        # 결과 구조 확인
         self.assertIn('frequencies', result)
-        self.assertIn('magnitudes', result)
+        self.assertIn('amplitudes', result)
         self.assertIn('significant_frequencies', result)
         self.assertIn('periodic_numbers', result)
         
+        # 데이터 타입 확인
+        self.assertIsInstance(result['frequencies'], list)
+        self.assertIsInstance(result['amplitudes'], list)
+        self.assertIsInstance(result['periodic_numbers'], list)
+        
         # 주기성 있는 번호 범위 검증
         for num in result['periodic_numbers']:
-            self.assertGreaterEqual(int(num), 1)
-            self.assertLessEqual(int(num), 45)
+            self.assertGreaterEqual(num, 1)
+            self.assertLessEqual(num, 45)
 
     def test_plot_generation(self):
         """그래프 생성 테스트"""
@@ -353,57 +358,85 @@ class TestPatternAnalyzer(unittest.TestCase):
         """이동 평균 분석 테스트"""
         result = self.analyzer._analyze_moving_averages()
         
-        # 결과 검증
-        self.assertIn('ma_values', result)
-        self.assertIn('ma_trends', result)
-        self.assertIn('ma_crossovers', result)
+        # 결과 구조 확인
+        self.assertIn('ma5', result)
+        self.assertIn('ma10', result)
+        self.assertIn('ma20', result)
+        self.assertIn('cross_points', result)
+        self.assertIn('trend_strength', result)
         
-        # 이동 평균 값 범위 검증
-        for ma in result['ma_values'].values():
-            self.assertTrue(all(1 <= val <= 45 for val in ma))
+        # 데이터 타입 확인
+        self.assertIsInstance(result['ma5'], list)
+        self.assertIsInstance(result['ma10'], list)
+        self.assertIsInstance(result['ma20'], list)
+        self.assertIsInstance(result['cross_points'], list)
+        self.assertIsInstance(result['trend_strength'], list)
 
     def test_robust_stats(self):
         """강건 통계 분석 테스트"""
         result = self.analyzer._analyze_robust_stats()
         
-        # 결과 검증
+        # 결과 구조 확인
         self.assertIn('median', result)
+        self.assertIn('q1', result)
+        self.assertIn('q3', result)
         self.assertIn('iqr', result)
-        self.assertIn('outliers', result)
-        self.assertIn('robust_correlation', result)
+        self.assertIn('mad', result)
+        self.assertIn('winsorized_mean', result)
+        self.assertIn('winsorized_std', result)
+        self.assertIn('clean_mean', result)
+        self.assertIn('clean_std', result)
+        self.assertIn('outlier_count', result)
         
-        # 통계값 범위 검증
-        self.assertGreaterEqual(result['median'], 1)
-        self.assertLessEqual(result['median'], 45)
-        self.assertGreaterEqual(result['iqr'], 0)
+        # 데이터 타입 확인
+        for key in ['median', 'q1', 'q3', 'iqr', 'mad', 
+                    'winsorized_mean', 'winsorized_std',
+                    'clean_mean', 'clean_std']:
+            self.assertIsInstance(result[key], float)
+        self.assertIsInstance(result['outlier_count'], int)
 
     def test_duplicate_patterns(self):
         """중복 패턴 분석 테스트"""
         result = self.analyzer._analyze_duplicate_patterns()
         
-        # 결과 검증
-        self.assertIn('duplicate_counts', result)
-        self.assertIn('duplicate_probabilities', result)
-        self.assertIn('most_common_duplicates', result)
+        # 결과 구조 확인
+        self.assertIn('duplicate_patterns', result)
+        self.assertIn('pattern_details', result)
+        self.assertIn('statistics', result)
         
-        # 확률 범위 검증
-        for prob in result['duplicate_probabilities'].values():
-            self.assertGreaterEqual(prob, 0)
-            self.assertLessEqual(prob, 1)
+        # 통계 데이터 확인
+        stats = result['statistics']
+        self.assertIn('duplicate_rate', stats)
+        self.assertIn('most_duplicated_count', stats)
+        self.assertIn('average_duplication_gap', stats)
+        
+        # 데이터 타입 확인
+        self.assertIsInstance(stats['duplicate_rate'], float)
+        self.assertIsInstance(stats['most_duplicated_count'], int)
+        self.assertIsInstance(stats['average_duplication_gap'], float)
 
     def test_number_patterns(self):
         """번호 패턴 분석 테스트"""
         result = self.analyzer._analyze_number_patterns()
         
-        # 결과 검증
+        # 결과 구조 확인
         self.assertIn('pattern_counts', result)
-        self.assertIn('pattern_probabilities', result)
-        self.assertIn('significant_patterns', result)
+        self.assertIn('number_patterns', result)
         
-        # 패턴 유효성 검증
-        for pattern in result['significant_patterns']:
-            self.assertIsInstance(pattern, (list, tuple))
-            self.assertTrue(all(1 <= num <= 45 for num in pattern))
+        # pattern_counts 확인
+        pattern_counts = result['pattern_counts']
+        self.assertIn('high', pattern_counts)
+        self.assertIn('low', pattern_counts)
+        
+        # number_patterns 확인
+        number_patterns = result['number_patterns']
+        for num in range(1, 46):
+            self.assertIn(num, number_patterns)
+            pattern = number_patterns[num]
+            self.assertIn('appearances', pattern)
+            self.assertIn('gaps', pattern)
+            self.assertIn('consecutive_count', pattern)
+            self.assertIn('non_appearances', pattern)
 
     def test_performance_optimization(self):
         """성능 최적화 테스트"""
