@@ -52,7 +52,7 @@ log_filename = LOG_DIR / f"lottery_error_{datetime.datetime.now().strftime('%Y%m
 
 # 콘솔 핸들러 (모든 레벨)
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+console_handler.setLevel(logging.ERROR)
 console_formatter = ColoredFormatter(
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
@@ -70,7 +70,7 @@ file_handler.setFormatter(file_formatter)
 
 # 로깅 설정 초기화
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)  # 루트 로거는 모든 메시지를 받음
+root_logger.setLevel(logging.ERROR)  # 루트 로거도 ERROR 레벨로 설정
 root_logger.addHandler(console_handler)
 root_logger.addHandler(file_handler)
 
@@ -133,29 +133,21 @@ def log_performance(func):
 
 # 로깅 설정
 def setup_logger(name: str) -> logging.Logger:
-    """로거 설정
-    
-    Args:
-        name: 로거 이름
-        
-    Returns:
-        설정된 로거
-    """
-    # 로그 디렉토리 생성
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    
-    # 로거 생성
+    """로거 설정"""
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.ERROR)  # 기본 레벨을 ERROR로 변경
     
-    # 콘솔 핸들러 (WARNING 이상만 표시)
+    # 기존 핸들러가 있다면 제거
+    while logger.handlers:
+        logger.removeHandler(logger.handlers[0])
+    
+    # 콘솔 핸들러
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)  # INFO에서 WARNING으로 변경
+    console_handler.setLevel(logging.ERROR)  # ERROR 이상만 출력
     
-    # 파일 핸들러 (모든 로그 기록)
+    # 파일 핸들러
     file_handler = logging.FileHandler('lottery/logs/app.log')
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.ERROR)  # ERROR 이상만 기록
     
     # 포맷터
     formatter = logging.Formatter(
