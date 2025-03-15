@@ -15,6 +15,7 @@ import pandas as pd
 import sys
 import os
 import time
+import traceback  # 추가: 상세 오류 추적을 위한 모듈
 
 # 프로젝트 루트 디렉토리를 Python 경로에 추가
 project_root = str(Path(__file__).parent.parent.parent)
@@ -28,58 +29,63 @@ from lottery.src.analysis.pattern_analyzer import PatternAnalyzer, PatternAnalys
 class TestPatternAnalyzer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        """테스트 클래스 초기화"""
-        # 임시 디렉토리 생성
-        cls.temp_dir = tempfile.mkdtemp()
-
-        # 설정 객체 생성
-        config_dict = {
-            'data': {
-                'historical_data_path': 'lottery/data/raw/lottery.csv',
-                'processed_data_path': 'lottery/data/processed/processed_data.pkl',
-                'numbers_to_select': 6,
-                'min_number': 1,
-                'max_number': 45,
-                'batch_size': 32,
-                'num_workers': 4
-            },
-            'pattern_analysis': {
-                'markov_chain_order': 2,
-                'fourier_window_size': 52,
-                'trend_window_size': 10,
-                'significance_level': 0.05,
-                'use_gpu': torch.cuda.is_available(),
-                'num_workers': 4,
-                'batch_size': 32,
-                'cache_size': 1000,
-                'cache_ttl': 300,
-                'use_amp': True,
-                'num_streams': 3,
-                'memory_fraction': 0.8,
-                'enable_jit': True,
-                'enable_fusion': True,
-                'enable_profiling': False
+        """ud14cuc2a4ud2b8 ud074ub798uc2a4 uc124uc815"""
+        try:
+            # uc784uc2dc ub514ub809ud1a0ub9ac uc0dduc131
+            cls.temp_dir = tempfile.mkdtemp()
+            
+            config_dict = {
+                'data': {
+                    'historical_data_path': 'lottery/data/raw/lottery.csv',
+                    'processed_data_path': 'lottery/data/processed/processed_data.pkl',
+                    'numbers_to_select': 6,
+                    'min_number': 1,
+                    'max_number': 45,
+                    'batch_size': 32,
+                    'num_workers': 4
+                },
+                'pattern_analysis': {
+                    'markov_chain_order': 2,
+                    'fourier_window_size': 52,
+                    'trend_window_size': 10,
+                    'significance_level': 0.05,
+                    'use_gpu': torch.cuda.is_available(),
+                    'num_workers': 4,
+                    'batch_size': 32,
+                    'cache_size': 1000
+                }
             }
-        }
-        cls.config = Config(config_dict)
-
-        # 데이터 매니저를 통한 데이터 로드
-        cls.data_manager = DataManager(cls.config)
-        cls.data_manager.load_data()
-        print(f"테스트 데이터 로드 완료: {len(cls.data_manager.data)} 행")
-
-        # 패턴 분석기 초기화
-        cls.analyzer = PatternAnalyzer(cls.config, cls.data_manager.data)
-        cls.analyzer._init_cache()
-
-        print(f"데이터 크기: {len(cls.analyzer.data)}")
-        print(f"첫 번째 행: {cls.analyzer.data.iloc[0]}")
+            cls.config = Config(config_dict)
+            cls.data_manager = DataManager(cls.config)
+            cls.data_manager.load_data()
+            cls.analyzer = PatternAnalyzer(cls.config, cls.data_manager.data)
+        except Exception as e:
+            print(f"\nuc124uc815 uc911 uc624ub958 ubc1cuc0dd: {e}")
+            print(f"\nuc0c1uc138 uc624ub958: {traceback.format_exc()}")
+            raise
 
     @classmethod
     def tearDownClass(cls):
         """테스트 클래스 정리"""
-        # 임시 디렉토리 삭제
-        shutil.rmtree(cls.temp_dir)
+        try:
+            # 분석기 정리
+            if hasattr(cls, 'analyzer'):
+                del cls.analyzer
+            
+            # 데이터 매니저 정리
+            if hasattr(cls, 'data_manager'):
+                del cls.data_manager
+            
+            # 임시 디렉토리 삭제
+            if hasattr(cls, 'temp_dir') and os.path.exists(cls.temp_dir):
+                shutil.rmtree(cls.temp_dir)
+            
+            # GPU 캐시 정리
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception:
+            pass  # 종료 시점에서는 에러 무시
 
     def test_initialization(self):
         """초기화 테스트"""
@@ -99,24 +105,29 @@ class TestPatternAnalyzer(unittest.TestCase):
 
     def test_analyze(self):
         """전체 분석 테스트"""
-        results = self.analyzer.analyze()
-        
-        # 기존 테스트
-        self.assertIn('frequency', results)
-        self.assertIn('sequence_patterns', results)
-        self.assertIn('oddeven_patterns', results)
-        self.assertIn('range_distribution', results)
-        self.assertIn('sum_patterns', results)
-        self.assertIn('gap_patterns', results)
-        self.assertIn('markov_chain', results)
-        self.assertIn('fourier', results)
-        
-        # 새로운 분석 결과 테스트
-        self.assertIn('duplicate_patterns', results)
-        self.assertIn('number_patterns', results)
-        self.assertIn('combination_stats', results)
-        self.assertIn('moving_averages', results)
-        self.assertIn('robust_stats', results)
+        try:
+            results = self.analyzer.analyze()
+            
+            # 기존 테스트
+            self.assertIn('frequency', results, "frequency 키가 결과에 없습니다")
+            self.assertIn('sequence_patterns', results, "sequence_patterns 키가 결과에 없습니다")
+            self.assertIn('oddeven_patterns', results, "oddeven_patterns 키가 결과에 없습니다")
+            self.assertIn('range_distribution', results, "range_distribution 키가 결과에 없습니다")
+            self.assertIn('sum_patterns', results, "sum_patterns 키가 결과에 없습니다")
+            self.assertIn('gap_patterns', results, "gap_patterns 키가 결과에 없습니다")
+            self.assertIn('markov_chain', results, "markov_chain 키가 결과에 없습니다")
+            self.assertIn('fourier', results, "fourier 키가 결과에 없습니다")
+            
+            # 새로운 분석 결과 테스트
+            self.assertIn('duplicate_patterns', results, "duplicate_patterns 키가 결과에 없습니다")
+            self.assertIn('number_patterns', results, "number_patterns 키가 결과에 없습니다")
+            self.assertIn('combination_stats', results, "combination_stats 키가 결과에 없습니다")
+            self.assertIn('moving_averages', results, "moving_averages 키가 결과에 없습니다")
+            self.assertIn('robust_stats', results, "robust_stats 키가 결과에 없습니다")
+        except Exception as e:
+            print(f"\n분석 테스트 중 오류 발생: {e}")
+            print(f"\n상세 오류: {traceback.format_exc()}")
+            raise
 
     def test_frequency_analysis(self):
         """빈도 분석 테스트"""
@@ -495,14 +506,13 @@ class TestPatternAnalyzer(unittest.TestCase):
         self.assertTrue((graph_dir / 'moving_averages.png').exists())
         self.assertTrue((graph_dir / 'robust_stats.png').exists())
 
-    def test_all_methods(self):
-        """모든 메서드 테스트"""
-        for method_name in ['_analyze_frequency', '_analyze_duplicate_patterns', '_analyze_fourier', 
-                           '_analyze_markov_chain', '_analyze_number_patterns', '_analyze_oddeven_patterns']:
+    def test_analyze_methods(self):
+        """각 분석 메소드 테스트"""
+        for method_name in self.analysis_methods:
             method = getattr(self.analyzer, method_name)
             result = method()
-            print(f"\n{method_name} 결과:")
-            print(result)
+            self.assertIsNotNone(result)
+            self.assertIsInstance(result, dict)
 
 if __name__ == '__main__':
     unittest.main()

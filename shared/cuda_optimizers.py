@@ -591,7 +591,7 @@ class CUDAOptimizer:
         self._setup_rtx4090_optimization()
         
         # AMP 설정
-        self.scaler = amp.GradScaler()
+        self.scaler = amp.GradScaler('cuda')
         
         # 스트림 관리
         self.streams = {}

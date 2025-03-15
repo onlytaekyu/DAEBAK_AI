@@ -18,7 +18,8 @@ env/
 .idea/
 
 # Project specific
-lottery/data/results/graph/
+lottery/data/
+lottery/savedModels/
 
 # Logs
 *.log
